@@ -1,7 +1,6 @@
 package opts
 
 import (
-	"fmt"
 	"strings"
 )
 
@@ -21,8 +20,11 @@ func ParseLabels(labels []string) (map[string]string, error) {
 
 func parseLabel(label string) ([]string, error) {
 	fields := strings.SplitN(label, "=", 2)
-	if len(fields) != 2 {
-		return nil, fmt.Errorf("invalid label %s: label must be in format of key=value", label)
+	//if len(fields) != 2 {
+	//	return nil, fmt.Errorf("invalid label %s: label must be in format of key=value", label)
+	//}
+	if len(fields) == 1 {
+		fields = append(fields,"")
 	}
 	return fields, nil
 }
