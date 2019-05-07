@@ -76,8 +76,15 @@ func (c *Client) Commit(ctx context.Context, config *CommitConfig) (_ digest.Dig
 	}
 	client := wrapperCli.client
 
+	// NOTE: make sure that gc scheduler doesn't remove content/snapshot during commmit
+	ctx, done, err := client.WithLease(ctx)
+	if err != nil {
+		return "", errors.Wrapf(err, "failed to create lease for commit")
+	}
+	defer done(ctx)
+
 	var (
-		sn     = client.SnapshotService(defaultSnapshotterName)
+		sn     = client.SnapshotService(CurrentSnapshotterName(ctx))
 		cs     = client.ContentStore()
 		differ = client.DiffService()
 	)
@@ -85,33 +92,26 @@ func (c *Client) Commit(ctx context.Context, config *CommitConfig) (_ digest.Dig
 	// export new layer
 	snapshot, err := c.GetSnapshot(ctx, config.ContainerID)
 	if err != nil {
-		return "", fmt.Errorf("failed to get snapshot: %s", err)
-	}
-	layer, diffIDStr, err := exportLayer(ctx, snapshot.Name, sn, cs, differ)
-	if err != nil {
-		return "", err
+		return "", errors.Wrap(err, "failed to get snapshot")
 	}
 
-	// create child image
-	diffIDDigest, err := digest.Parse(diffIDStr)
+	layer, diffID, err := exportLayer(ctx, snapshot.Name, sn, cs, differ)
 	if err != nil {
-		return "", err
+		return "", errors.Wrap(err, "failed to export layer")
 	}
 
-	childImg, err := newChildImage(ctx, config, diffIDDigest)
-	if err != nil {
-		return "", err
-	}
+	childImg := newChildImage(ctx, config, diffID)
 
 	// create new snapshot for new layer
-	snapshotKey := identity.ChainID(childImg.RootFS.DiffIDs).String()
-	if err = newSnapshot(ctx, config.Image, sn, differ, layer, snapshotKey, diffIDStr); err != nil {
+	rootfsID := identity.ChainID(childImg.RootFS.DiffIDs).String()
+	if err = newSnapshot(ctx, rootfsID, config.Image, sn, differ, layer); err != nil {
 		return "", err
 	}
+
 	defer func() {
 		if err0 != nil {
-			logrus.Warnf("remove snapshot %s cause commit image failed", snapshotKey)
-			client.SnapshotService(defaultSnapshotterName).Remove(ctx, snapshotKey)
+			logrus.Warnf("remove snapshot %s cause commit image failed", rootfsID)
+			client.SnapshotService(CurrentSnapshotterName(ctx)).Remove(ctx, rootfsID)
 		}
 	}()
 
@@ -143,12 +143,18 @@ func (c *Client) Commit(ctx context.Context, config *CommitConfig) (_ digest.Dig
 	}
 
 	// new manifest descriptor
-	mfst := ocispec.Manifest{
-		Versioned: specs.Versioned{
-			SchemaVersion: 2,
+	mfst := struct {
+		MediaType string `json:"mediaType,omitempty"`
+		ocispec.Manifest
+	}{
+		MediaType: manifestType,
+		Manifest: ocispec.Manifest{
+			Versioned: specs.Versioned{
+				SchemaVersion: 2,
+			},
+			Config: configDesc,
+			Layers: layers,
 		},
-		Config: configDesc,
-		Layers: layers,
 	}
 
 	mfstJSON, err := json.MarshalIndent(mfst, "", "   ")
@@ -180,18 +186,24 @@ func (c *Client) Commit(ctx context.Context, config *CommitConfig) (_ digest.Dig
 		if !errdefs.IsNotFound(err) {
 			return "", fmt.Errorf("failed to cover exist image %s", err)
 		}
+
 		if _, err := client.ImageService().Create(ctx, img); err != nil {
 			return "", fmt.Errorf("failed to create new image %s", err)
 		}
 	}
 
 	// write manifest content
-	if err := content.WriteBlob(ctx, cs, mfstDigest.String(), bytes.NewReader(mfstJSON), mfstDesc.Size, mfstDesc.Digest, content.WithLabels(labels)); err != nil {
+	ref := mfstDigest.String()
+	if err := content.WriteBlob(ctx, cs, ref, bytes.NewReader(mfstJSON), mfstDesc, content.WithLabels(labels)); err != nil {
 		return "", errors.Wrapf(err, "error writing manifest blob %s", mfstDigest)
 	}
 
 	// write config content
-	if err := content.WriteBlob(ctx, cs, configDesc.Digest.String(), bytes.NewReader(imgJSON), configDesc.Size, configDesc.Digest); err != nil {
+	ref = configDesc.Digest.String()
+	labelOpt := content.WithLabels(map[string]string{
+		fmt.Sprintf("containerd.io/gc.ref.snapshot.%s", CurrentSnapshotterName(ctx)): rootfsID,
+	})
+	if err := content.WriteBlob(ctx, cs, ref, bytes.NewReader(imgJSON), configDesc, labelOpt); err != nil {
 		return "", errors.Wrap(err, "error writing config blob")
 	}
 
@@ -200,22 +212,26 @@ func (c *Client) Commit(ctx context.Context, config *CommitConfig) (_ digest.Dig
 }
 
 // export a new layer from a container
-func exportLayer(ctx context.Context, name string, sn snapshots.Snapshotter, cs content.Store, differ diff.Differ) (ocispec.Descriptor, string, error) {
+func exportLayer(ctx context.Context, name string, sn snapshots.Snapshotter, cs content.Store, comparer diff.Comparer) (ocispec.Descriptor, digest.Digest, error) {
 	// export new layer
-	rwDesc, err := rootfs.Diff(ctx, name, sn, differ, diff.WithLabels(map[string]string{
-		"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339Nano),
-	}))
+	rwDesc, err := rootfs.CreateDiff(ctx, name, sn, comparer)
 	if err != nil {
-		return ocispec.Descriptor{}, "", fmt.Errorf("failed to diff: %s", err)
+		return ocispec.Descriptor{}, digest.Digest(""), fmt.Errorf("failed to diff: %s", err)
 	}
 
 	info, err := cs.Info(ctx, rwDesc.Digest)
 	if err != nil {
-		return ocispec.Descriptor{}, "", fmt.Errorf("failed to get exported layer info: %s", err)
+		return ocispec.Descriptor{}, digest.Digest(""), fmt.Errorf("failed to get exported layer info: %s", err)
 	}
+
 	diffIDStr, ok := info.Labels[containerdUncompressed]
 	if !ok {
-		return ocispec.Descriptor{}, "", fmt.Errorf("invalid differ response with no diffID")
+		return ocispec.Descriptor{}, digest.Digest(""), fmt.Errorf("invalid differ response with no diffID")
+	}
+
+	diffID, err := digest.Parse(diffIDStr)
+	if err != nil {
+		return ocispec.Descriptor{}, digest.Digest(""), err
 	}
 
 	layer := ocispec.Descriptor{
@@ -223,14 +239,13 @@ func exportLayer(ctx context.Context, name string, sn snapshots.Snapshotter, cs 
 		Digest:    rwDesc.Digest,
 		Size:      info.Size,
 	}
-
-	return layer, diffIDStr, nil
+	return layer, diffID, nil
 }
 
 // create a new child image descriptor
-func newChildImage(ctx context.Context, config *CommitConfig, diffIDDigest digest.Digest) (ocispec.Image, error) {
+func newChildImage(ctx context.Context, config *CommitConfig, diffID digest.Digest) ocispec.Image {
 	createdTime := time.Now()
-	emptyLayer := (diffIDDigest == emptyGZLayer)
+	emptyLayer := (diffID == emptyGZLayer)
 	history := ocispec.History{
 		Created:    &createdTime,
 		CreatedBy:  strings.Join(config.ContainerConfig.Cmd, " "),
@@ -241,7 +256,7 @@ func newChildImage(ctx context.Context, config *CommitConfig, diffIDDigest diges
 
 	// new child image
 	pImg := config.Image
-	image := ocispec.Image{
+	return ocispec.Image{
 		Architecture: runtime.GOARCH,
 		OS:           runtime.GOOS,
 		Created:      &createdTime,
@@ -249,25 +264,20 @@ func newChildImage(ctx context.Context, config *CommitConfig, diffIDDigest diges
 		Config:       newImageConfig(config.ContainerConfig),
 		RootFS: ocispec.RootFS{
 			Type:    "layers",
-			DiffIDs: append(pImg.RootFS.DiffIDs, diffIDDigest),
+			DiffIDs: append(pImg.RootFS.DiffIDs, diffID),
 		},
 		History: append(pImg.History, history),
 	}
-
-	return image, nil
 }
 
 // create a new snapshot for exported layer
-func newSnapshot(ctx context.Context, pImg ocispec.Image, sn snapshots.Snapshotter, differ diff.Differ, layer ocispec.Descriptor, name, diffIDStr string) error {
-	diffIDs := pImg.RootFS.DiffIDs
-	parent := identity.ChainID(diffIDs).String()
+func newSnapshot(ctx context.Context, name string, pImg ocispec.Image, sn snapshots.Snapshotter, differ diff.Applier, layer ocispec.Descriptor) error {
+	var (
+		key    = randomid.Generate()
+		parent = identity.ChainID(pImg.RootFS.DiffIDs).String()
+	)
 
-	key := randomid.Generate()
-	// avoid active snapshots cleaned by containerd 1.0.3 gc
-	opt := snapshots.WithLabels(map[string]string{
-		"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339),
-	})
-	mount, err := sn.Prepare(ctx, key, parent, opt)
+	mount, err := sn.Prepare(ctx, key, parent)
 	if err != nil {
 		return err
 	}
@@ -277,15 +287,7 @@ func newSnapshot(ctx context.Context, pImg ocispec.Image, sn snapshots.Snapshott
 		return fmt.Errorf("failed to apply layer: %s", err)
 	}
 
-	withLabels := func(info *snapshots.Info) error {
-		info.Labels = map[string]string{
-			containerdUncompressed:  diffIDStr,
-			"containerd.io/gc.root": time.Now().UTC().Format(time.RFC3339Nano),
-		}
-		return nil
-	}
-
-	if err = sn.Commit(ctx, name, key, withLabels); err != nil {
+	if err = sn.Commit(ctx, name, key); err != nil {
 		if !errdefs.IsAlreadyExists(err) {
 			return fmt.Errorf("failed to commit snapshot %s: %s", key, err)
 		}
@@ -295,7 +297,6 @@ func newSnapshot(ctx context.Context, pImg ocispec.Image, sn snapshots.Snapshott
 			return fmt.Errorf("failed to cleanup aborted apply %s: %s", key, err)
 		}
 	}
-
 	return nil
 }
 

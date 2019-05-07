@@ -1,56 +1,63 @@
 package ctrd
 
 import (
-	"context"
 	"crypto/tls"
 	"net"
 	"net/http"
+	"net/url"
+	"syscall"
 	"time"
 
 	"github.com/alibaba/pouch/apis/types"
 	"github.com/alibaba/pouch/pkg/errtypes"
 
-	"github.com/containerd/containerd/containers"
+	"github.com/containerd/containerd"
 	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/namespaces"
-	"github.com/containerd/containerd/oci"
 	"github.com/containerd/containerd/remotes"
 	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/runtime/linux/runctypes"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
+	"github.com/sirupsen/logrus"
 )
 
-// NewDefaultSpec new a template spec with default.
-func NewDefaultSpec(ctx context.Context, id string) (*specs.Spec, error) {
-	ctx = namespaces.WithNamespace(ctx, namespaces.Default)
-	return oci.GenerateSpec(ctx, nil, &containers.Container{ID: id})
+func withExitShimV1CheckpointTaskOpts() containerd.CheckpointTaskOpts {
+	return func(r *containerd.CheckpointTaskInfo) error {
+		r.Options = &runctypes.CheckpointOptions{
+			Exit: true,
+		}
+		return nil
+	}
 }
 
-func resolver(authConfig *types.AuthConfig) (remotes.Resolver, error) {
+// isInsecureDomain will return true if the domain of reference is in the
+// insecure registry. The insecure registry will accept HTTP or HTTPS with
+// certificates from unknown CAs.
+func (c *Client) isInsecureDomain(ref string) bool {
+	u, err := url.Parse("dummy://" + ref)
+	if err != nil {
+		logrus.Warning("failed to parse reference(%s) into url: %v", ref, err)
+		return false
+	}
+
+	for _, r := range c.insecureRegistries {
+		if r == u.Host {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Client) getResolver(authConfig *types.AuthConfig, ref string, resolverOpt docker.ResolverOptions) (remotes.Resolver, error) {
 	var (
-		// TODO
-		username  = ""
-		secret    = ""
-		plainHTTP = false
-		refresh   = ""
-		insecure  = false
+		username = ""
+		secret   = ""
+		insecure = c.isInsecureDomain(ref)
 	)
 
 	if authConfig != nil {
 		username = authConfig.Username
 		secret = authConfig.Password
-	}
-
-	// FIXME
-	_ = refresh
-
-	options := docker.ResolverOptions{
-		PlainHTTP: plainHTTP,
-		Tracker:   docker.NewInMemoryTracker(),
-	}
-	options.Credentials = func(host string) (string, string, error) {
-		// Only one host
-		return username, secret, nil
 	}
 
 	tr := &http.Transport{
@@ -69,11 +76,60 @@ func resolver(authConfig *types.AuthConfig) (remotes.Resolver, error) {
 		ExpectContinueTimeout: 5 * time.Second,
 	}
 
-	options.Client = &http.Client{
-		Transport: tr,
+	options := docker.ResolverOptions{
+		Tracker:   resolverOpt.Tracker,
+		PlainHTTP: insecure,
+		Credentials: func(host string) (string, string, error) {
+			// Only one host
+			return username, secret, nil
+		},
+		Client: &http.Client{
+			Transport: tr,
+		},
+	}
+	return docker.NewResolver(options), nil
+}
+
+// GetWeightDevice Convert weight device from []*types.WeightDevice to []specs.LinuxWeightDevice
+func GetWeightDevice(devs []*types.WeightDevice) ([]specs.LinuxWeightDevice, error) {
+	var stat syscall.Stat_t
+	var weightDevice []specs.LinuxWeightDevice
+
+	for _, dev := range devs {
+		if err := syscall.Stat(dev.Path, &stat); err != nil {
+			return nil, err
+		}
+
+		d := specs.LinuxWeightDevice{
+			Weight: &dev.Weight,
+		}
+		d.Major = int64(stat.Rdev >> 8)
+		d.Minor = int64(stat.Rdev & 255)
+		weightDevice = append(weightDevice, d)
 	}
 
-	return docker.NewResolver(options), nil
+	return weightDevice, nil
+}
+
+// GetThrottleDevice Convert throttle device from []*types.ThrottleDevice to []specs.LinuxThrottleDevice
+func GetThrottleDevice(devs []*types.ThrottleDevice) ([]specs.LinuxThrottleDevice, error) {
+	var stat syscall.Stat_t
+	var ThrottleDevice []specs.LinuxThrottleDevice
+
+	for _, dev := range devs {
+		if err := syscall.Stat(dev.Path, &stat); err != nil {
+			return nil, err
+		}
+
+		d := specs.LinuxThrottleDevice{
+			Rate: dev.Rate,
+		}
+		d.Major = int64(stat.Rdev >> 8)
+		d.Minor = int64(stat.Rdev & 255)
+		ThrottleDevice = append(ThrottleDevice, d)
+	}
+
+	return ThrottleDevice, nil
 }
 
 // toLinuxResources transfers Pouch Resources to LinuxResources.
@@ -81,8 +137,28 @@ func toLinuxResources(resources types.Resources) (*specs.LinuxResources, error) 
 	r := &specs.LinuxResources{}
 
 	// toLinuxBlockIO
+	readBpsDevice, err := GetThrottleDevice(resources.BlkioDeviceReadBps)
+	if err != nil {
+		return nil, err
+	}
+	readIOpsDevice, err := GetThrottleDevice(resources.BlkioDeviceReadIOps)
+	if err != nil {
+		return nil, err
+	}
+	writeBpsDevice, err := GetThrottleDevice(resources.BlkioDeviceWriteBps)
+	if err != nil {
+		return nil, err
+	}
+	writeIOpsDevice, err := GetThrottleDevice(resources.BlkioDeviceWriteIOps)
+	if err != nil {
+		return nil, err
+	}
 	r.BlockIO = &specs.LinuxBlockIO{
-		Weight: &resources.BlkioWeight,
+		Weight:                  &resources.BlkioWeight,
+		ThrottleReadBpsDevice:   readBpsDevice,
+		ThrottleReadIOPSDevice:  readIOpsDevice,
+		ThrottleWriteBpsDevice:  writeBpsDevice,
+		ThrottleWriteIOPSDevice: writeIOpsDevice,
 	}
 
 	// toLinuxCPU
@@ -101,6 +177,8 @@ func toLinuxResources(resources types.Resources) (*specs.LinuxResources, error) 
 		Limit:       &resources.Memory,
 		Swap:        &resources.MemorySwap,
 		Reservation: &resources.MemoryReservation,
+		Kernel:      &resources.KernelMemory,
+		// TODO: add other fields of specs.LinuxMemory
 	}
 
 	// TODO: add more fields.

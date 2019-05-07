@@ -100,17 +100,16 @@ func TestConfigValidate(t *testing.T) {
 	// Test cri configuration
 	cfg = &Config{
 		IsCriEnabled: true,
-		ListenCRI:    "unix:///tmp/test/pouch/pouchcri.sock",
 		CriConfig: criconfig.Config{
-			Listen:                 "unix:///var/run/pouchd.sock",
-			NetworkPluginBinDir:    "cni-bin-dir",
-			NetworkPluginConfDir:   "cni-conf-dir",
-			SandboxImage:           "registry.hub.docker.com/library/busybox",
-			CriVersion:             "v1alpha2",
-			StreamServerPort:       "10010",
-			StreamServerReusePort:  true,
-			CriStatsCollectPeriod:  10,
-			DisableCriStatsCollect: false,
+			Listen:                "unix:///var/run/pouchd.sock",
+			NetworkPluginBinDir:   "cni-bin-dir",
+			NetworkPluginConfDir:  "cni-conf-dir",
+			SandboxImage:          "registry.hub.docker.com/library/busybox",
+			CriVersion:            "v1alpha2",
+			StreamServerPort:      "10010",
+			StreamServerReusePort: true,
+			CriStatsCollectPeriod: 10,
+			EnableCriStatsCollect: false,
 		},
 	}
 	assert.Equal(nil, cfg.Validate())
@@ -302,4 +301,29 @@ func TestMergeConfigurations(t *testing.T) {
 	assert.NoError(err)
 
 	defer os.Remove(configFile)
+}
+
+func TestValidateCgroupDriver(t *testing.T) {
+	for _, tc := range []struct {
+		driver    string
+		expectErr bool
+	}{
+		{
+			driver:    CgroupfsDriver,
+			expectErr: false,
+		},
+		{
+			driver:    CgroupSystemdDriver,
+			expectErr: false,
+		},
+		{
+			driver:    "foo",
+			expectErr: true,
+		},
+	} {
+		err := validateCgroupDriver(tc.driver)
+		if tc.expectErr != (err != nil) {
+			t.Fatalf("expectd error: %v, but get %s", tc.expectErr, err)
+		}
+	}
 }

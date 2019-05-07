@@ -66,3 +66,32 @@ func GetMajMinNumOfDevice(device string) (string, bool) {
 	}
 	return "", false
 }
+
+// StringSliceTrimSpace delete empty items from string slice
+func StringSliceTrimSpace(input []string) ([]string, error) {
+	output := []string{}
+
+	for _, item := range input {
+		str := strings.TrimSpace(item)
+		if str != "" {
+			output = append(output, str)
+		}
+	}
+
+	return output, nil
+}
+
+// ParseCgroupFile parse cgroup path from cgroup file
+func ParseCgroupFile(text string) map[string]string {
+	cgroups := make(map[string]string)
+	for _, t := range strings.Split(text, "\n") {
+		parts := strings.SplitN(t, ":", 3)
+		if len(parts) < 3 {
+			continue
+		}
+		for _, sub := range strings.Split(parts[1], ",") {
+			cgroups[sub] = parts[2]
+		}
+	}
+	return cgroups
+}

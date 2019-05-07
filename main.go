@@ -33,26 +33,28 @@ var (
 	sigHandles   []func() error
 	printVersion bool
 	logOpts      []string
+	cfg          = &config.Config{}
 )
 
-var cfg = &config.Config{}
+var rootCmd = &cobra.Command{
+	Use:               "pouchd",
+	Short:             "An Efficient Enterprise-class Container Engine",
+	Args:              cobra.NoArgs,
+	SilenceUsage:      true,
+	DisableAutoGenTag: true, // disable displaying auto generation tag in cli docs
+	RunE: func(cmd *cobra.Command, args []string) error {
+		return runDaemon(cmd)
+	},
+}
 
 func main() {
 	if reexec.Init() {
 		return
 	}
 
-	var cmdServe = &cobra.Command{
-		Use:          "pouchd",
-		Args:         cobra.NoArgs,
-		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runDaemon(cmd)
-		},
-	}
+	setupFlags(rootCmd)
 
-	setupFlags(cmdServe)
-	if err := cmdServe.Execute(); err != nil {
+	if err := rootCmd.Execute(); err != nil {
 		logrus.Error(err)
 		os.Exit(1)
 	}
@@ -79,7 +81,7 @@ func setupFlags(cmd *cobra.Command) {
 	flagSet.StringVar(&cfg.CriConfig.StreamServerPort, "stream-server-port", "10010", "The port stream server of cri is listening on.")
 	flagSet.BoolVar(&cfg.CriConfig.StreamServerReusePort, "stream-server-reuse-port", false, "Specify whether cri stream server share port with pouchd. If this is true, the listen option of pouchd should specify a tcp socket and its port should be same with stream-server-port.")
 	flagSet.IntVar(&cfg.CriConfig.CriStatsCollectPeriod, "cri-stats-collect-period", 10, "The time duration (in time.Second) cri collect stats from containerd.")
-	flagSet.BoolVar(&cfg.CriConfig.DisableCriStatsCollect, "disable-cri-stats-collect", false, "Specify whether cri collect stats from containerd.If this is true, option CriStatsCollectPeriod will take no effect.")
+	flagSet.BoolVar(&cfg.CriConfig.EnableCriStatsCollect, "enable-cri-stats-collect", false, "Specify whether cri collect stats from containerd. If this is true, option CriStatsCollectPeriod will take effect.")
 	flagSet.BoolVarP(&cfg.Debug, "debug", "D", false, "Switch daemon log level to DEBUG mode")
 	flagSet.StringVarP(&cfg.ContainerdAddr, "containerd", "c", "/var/run/containerd.sock", "Specify listening address of containerd")
 	flagSet.StringVar(&cfg.ContainerdPath, "containerd-path", "", "Specify the path of containerd binary")
@@ -98,6 +100,8 @@ func setupFlags(cmd *cobra.Command) {
 	flagSet.StringVar(&cfg.ImageProxy, "image-proxy", "", "Http proxy to pull image")
 	flagSet.StringVar(&cfg.QuotaDriver, "quota-driver", "", "Set quota driver(grpquota/prjquota), if not set, it will set by kernel version")
 	flagSet.StringVar(&cfg.ConfigFile, "config-file", "/etc/pouch/config.json", "Configuration file of pouchd")
+	flagSet.StringVar(&cfg.Snapshotter, "snapshotter", "overlayfs", "Snapshotter driver of pouchd, it will be passed to containerd")
+	flagSet.BoolVar(&cfg.AllowMultiSnapshotter, "allow-multi-snapshotter", false, "If set true, pouchd will allow multi snapshotter")
 
 	// volume config
 	flagSet.StringVar(&cfg.VolumeConfig.DriverAlias, "volume-driver-alias", "", "Set volume driver alias, <name=alias>[;name1=alias1]")
@@ -121,7 +125,7 @@ func setupFlags(cmd *cobra.Command) {
 	flagSet.StringArrayVar(&logOpts, "log-opt", nil, "Set default log driver options")
 
 	// cgroup-path flag is to set parent cgroup for all containers, default is "default" staying with containerd's configuration.
-	flagSet.StringVar(&cfg.CgroupParent, "cgroup-parent", "default", "Set parent cgroup for all containers")
+	flagSet.StringVar(&cfg.CgroupParent, "cgroup-parent", "", "Set parent cgroup for all containers")
 	flagSet.StringSliceVar(&cfg.Labels, "label", []string{}, "Set metadata for Pouch daemon")
 	flagSet.BoolVar(&cfg.EnableProfiler, "enable-profiler", false, "Set if pouchd setup profiler")
 	flagSet.StringVar(&cfg.Pidfile, "pidfile", "/var/run/pouch.pid", "Save daemon pid")
@@ -132,6 +136,10 @@ func setupFlags(cmd *cobra.Command) {
 	// value is 'default'. So if IsCriEnabled is true for k8s, we should set the DefaultNamespace
 	// to k8s.io
 	flagSet.StringVar(&cfg.DefaultNamespace, "default-namespace", namespaces.Default, "default-namespace is passed to containerd, the default value is 'default'")
+	flagSet.StringVar(&cfg.CgroupDriver, "cgroup-driver", "cgroupfs", "Set cgroup driver for all containers(cgroupfs|systemd), default cgroupfs")
+
+	// registry
+	flagSet.StringArrayVar(&cfg.InsecureRegistries, "insecure-registries", []string{}, "enable insecure registry")
 }
 
 // runDaemon prepares configs, setups essential details and runs pouchd daemon.
@@ -145,7 +153,10 @@ func runDaemon(cmd *cobra.Command) error {
 	if err != nil {
 		return err
 	}
-	cfg.DefaultLogConfig.LogOpts = logOptMap
+
+	if len(logOptMap) > 0 {
+		cfg.DefaultLogConfig.LogOpts = logOptMap
+	}
 
 	//user specifies --version or -v, print version and return.
 	if printVersion {

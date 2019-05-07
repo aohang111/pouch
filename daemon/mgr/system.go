@@ -10,6 +10,7 @@ import (
 
 	"github.com/alibaba/pouch/apis/filters"
 	"github.com/alibaba/pouch/apis/types"
+	"github.com/alibaba/pouch/ctrd"
 	"github.com/alibaba/pouch/daemon/config"
 	"github.com/alibaba/pouch/daemon/events"
 	"github.com/alibaba/pouch/pkg/errtypes"
@@ -19,9 +20,9 @@ import (
 	"github.com/alibaba/pouch/registry"
 	volumedriver "github.com/alibaba/pouch/storage/volume/driver"
 	"github.com/alibaba/pouch/version"
+
 	"github.com/opencontainers/runc/libcontainer/apparmor"
 	selinux "github.com/opencontainers/selinux/go-selinux"
-
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
@@ -143,8 +144,7 @@ func (mgr *SystemManager) Info() (types.SystemInfo, error) {
 		ContainersStopped: cStopped,
 		Debug:             mgr.config.Debug,
 		DefaultRuntime:    mgr.config.DefaultRuntime,
-		// FIXME: avoid hard code
-		Driver: "overlayfs",
+		Driver:            ctrd.CurrentSnapshotterName(context.TODO()),
 		// DriverStatus: ,
 		ExperimentalBuild: false,
 		HTTPProxy:         mgr.config.ImageProxy,

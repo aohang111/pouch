@@ -187,27 +187,6 @@ func GetQuotaID(dir string) (uint32, error) {
 	return id, nil
 }
 
-//GetDefaultQuota returns the default quota size.
-func GetDefaultQuota(quotas map[string]string) string {
-	if quotas == nil {
-		return ""
-	}
-
-	// "/" means the disk quota only takes effect on rootfs + 0 * volume
-	quota, ok := quotas["/"]
-	if ok && quota != "" {
-		return quota
-	}
-
-	// ".*" means the disk quota only takes effect on rootfs + n * volume
-	quota, ok = quotas[".*"]
-	if ok && quota != "" {
-		return quota
-	}
-
-	return ""
-}
-
 // SetRootfsDiskQuota is to set container rootfs dir disk quota.
 func SetRootfsDiskQuota(basefs, size string, quotaID uint32) (uint32, error) {
 	overlayMountInfo, err := getOverlayMountInfo(basefs)
@@ -230,6 +209,10 @@ func SetRootfsDiskQuota(basefs, size string, quotaID uint32) (uint32, error) {
 
 		if err := SetDiskQuota(dir, size, quotaID); err != nil {
 			return 0, errors.Wrapf(err, "failed to set dir(%s) disk quota", dir)
+		}
+
+		if err := SetQuotaForDir(dir, quotaID); err != nil {
+			return 0, errors.Wrapf(err, "failed to set dir(%s) quota recursively", dir)
 		}
 	}
 
@@ -264,6 +247,11 @@ func CheckRegularFile(file string) (bool, error) {
 	}
 
 	return false, nil
+}
+
+// IsSetQuotaID returns whether set quota id
+func IsSetQuotaID(id string) bool {
+	return id != "" && id != "0"
 }
 
 // getOverlayMountInfo gets overlayFS informantion from /proc/mounts.

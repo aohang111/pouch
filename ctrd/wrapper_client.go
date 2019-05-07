@@ -1,11 +1,11 @@
 package ctrd
 
 import (
-	"context"
 	"fmt"
 	"sync"
 
 	"github.com/containerd/containerd"
+	"github.com/containerd/containerd/leases"
 	"github.com/pkg/errors"
 )
 
@@ -18,40 +18,26 @@ type WrapperClient struct {
 	// Lease is a new feature of containerd, We use it to avoid that the images
 	// are removed by garbage collection. If no lease is defined, the downloaded images will
 	// be removed automatically when the container is removed.
-	lease *containerd.Lease
+	lease *leases.Lease
 
 	mux sync.Mutex
 	// streamQuota records the numbers of stream client without be using
 	streamQuota int
 }
 
-func newWrapperClient(rpcAddr string, defaultns string, maxStreamsClient int) (*WrapperClient, error) {
+func newWrapperClient(rpcAddr string, defaultns string, maxStreamsClient int, lease *leases.Lease) (*WrapperClient, error) {
 	options := []containerd.ClientOpt{
 		containerd.WithDefaultNamespace(defaultns),
 	}
+
 	cli, err := containerd.New(rpcAddr, options...)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to connect containerd")
 	}
 
-	// create a new lease or reuse the existed.
-	var lease containerd.Lease
-
-	leases, err := cli.ListLeases(context.TODO())
-	if err != nil {
-		return nil, err
-	}
-	if len(leases) != 0 {
-		lease = leases[0]
-	} else {
-		if lease, err = cli.CreateLease(context.TODO()); err != nil {
-			return nil, err
-		}
-	}
-
 	return &WrapperClient{
 		client:      cli,
-		lease:       &lease,
+		lease:       lease,
 		streamQuota: maxStreamsClient,
 	}, nil
 }

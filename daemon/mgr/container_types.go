@@ -1,6 +1,7 @@
 package mgr
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/alibaba/pouch/apis/types"
 	"github.com/alibaba/pouch/cri/stream/remotecommand"
+	"github.com/alibaba/pouch/ctrd"
 	"github.com/alibaba/pouch/pkg/meta"
 	"github.com/alibaba/pouch/pkg/utils"
 
@@ -190,7 +192,7 @@ type Container struct {
 	Driver string `json:"Driver,omitempty"`
 
 	// exec ids
-	ExecIds string `json:"ExecIDs,omitempty"`
+	ExecIds []string `json:"-"`
 
 	// Snapshotter, GraphDriver is same, keep both
 	// just for compatibility
@@ -271,28 +273,17 @@ type Container struct {
 
 // Key returns container's id.
 func (c *Container) Key() string {
-	c.Lock()
-	defer c.Unlock()
 	return c.ID
 }
 
 // SnapshotKey returns id of container's snapshot
 func (c *Container) SnapshotKey() string {
-	c.Lock()
-	defer c.Unlock()
 	// for old container, SnapshotKey equals to Container ID
 	if c.SnapshotID == "" {
 		return c.ID
 	}
 
 	return c.SnapshotID
-}
-
-// SetSnapshotID sets the snapshot id of container
-func (c *Container) SetSnapshotID(snapID string) {
-	c.Lock()
-	defer c.Unlock()
-	c.SnapshotID = snapID
 }
 
 // Write writes container's meta data into meta store.
@@ -302,8 +293,6 @@ func (c *Container) Write(store *meta.Store) error {
 
 // StopTimeout returns the timeout (in seconds) used to stop the container.
 func (c *Container) StopTimeout() int64 {
-	c.Lock()
-	defer c.Unlock()
 	if c.Config.StopTimeout != nil {
 		return *c.Config.StopTimeout
 	}
@@ -311,8 +300,6 @@ func (c *Container) StopTimeout() int64 {
 }
 
 func (c *Container) merge(getconfig func() (v1.ImageConfig, error)) error {
-	c.Lock()
-	defer c.Unlock()
 	imageConf, err := getconfig()
 	if err != nil {
 		return err
@@ -389,8 +376,6 @@ func (c *Container) merge(getconfig func() (v1.ImageConfig, error)) error {
 
 // FormatStatus format container status
 func (c *Container) FormatStatus() (string, error) {
-	c.Lock()
-	defer c.Unlock()
 	var status string
 
 	switch c.State.Status {
@@ -439,9 +424,8 @@ func (c *Container) FormatStatus() (string, error) {
 }
 
 // UnsetMergedDir unsets Snapshot MergedDir. Stop a container will
-// delete the containerd container, the merged dir
-// will also be deleted, so we should unset the
-// container's MergedDir.
+// delete the containerd container, the merged dir  will also be
+// deleted, so we should unset the container's MergedDir.
 func (c *Container) UnsetMergedDir() {
 	if c.Snapshotter == nil || c.Snapshotter.Data == nil {
 		return
@@ -466,7 +450,7 @@ func (c *Container) SetSnapshotterMeta(mounts []mount.Mount) {
 	}
 
 	c.Snapshotter = &types.SnapshotterData{
-		Name: "overlayfs",
+		Name: ctrd.CurrentSnapshotterName(context.TODO()),
 		Data: data,
 	}
 }
@@ -489,6 +473,39 @@ func (c *Container) GetSpecificBasePath(path string) string {
 	}
 
 	return ""
+}
+
+// CleanRootfsSnapshotDirs deletes container's rootfs snapshot MergedDir, UpperDir and
+// WorkDir. Since the snapshot of container created by containerd will be cleaned by
+// containerd, so we only clean rootfs that is RootFSProvided.
+func (c *Container) CleanRootfsSnapshotDirs() error {
+	// if RootFSProvided is not set or Snapshotter data empty , we no need clean the rootfs
+	if !c.RootFSProvided || c.Snapshotter == nil || c.Snapshotter.Data == nil {
+		return nil
+	}
+
+	var (
+		removeDirs []string
+	)
+
+	for _, dir := range []string{"MergedDir", "UpperDir", "WorkDir"} {
+		if v, ok := c.Snapshotter.Data[dir]; ok {
+			removeDirs = append(removeDirs, v)
+		}
+	}
+
+	var errMsgs []string
+	for _, dir := range removeDirs {
+		if err := os.RemoveAll(dir); err != nil {
+			errMsgs = append(errMsgs, err.Error())
+		}
+	}
+
+	if len(errMsgs) != 0 {
+		return fmt.Errorf(strings.Join(errMsgs, "\n"))
+	}
+
+	return nil
 }
 
 // ContainerRestartPolicy represents the policy is used to manage container.

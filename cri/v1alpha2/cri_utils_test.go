@@ -9,6 +9,7 @@ import (
 	"time"
 
 	apitypes "github.com/alibaba/pouch/apis/types"
+	anno "github.com/alibaba/pouch/cri/annotations"
 	runtime "github.com/alibaba/pouch/cri/apis/v1alpha2"
 	"github.com/alibaba/pouch/daemon/mgr"
 	"github.com/alibaba/pouch/pkg/utils"
@@ -510,32 +511,6 @@ func Test_parseContainerName(t *testing.T) {
 	}
 }
 
-func Test_makeupLogPath(t *testing.T) {
-	testCases := []struct {
-		logDirectory  string
-		containerMeta *runtime.ContainerMetadata
-		expected      string
-	}{
-		{
-			logDirectory:  "/var/log/pods/099f1c2b79126109140a1f77e211df00",
-			containerMeta: &runtime.ContainerMetadata{Name: "kube-scheduler", Attempt: 0},
-			expected:      "/var/log/pods/099f1c2b79126109140a1f77e211df00/kube-scheduler/0.log",
-		},
-		{
-			logDirectory:  "/var/log/pods/d875aada-9920-11e8-bfef-0242ac11001e/",
-			containerMeta: &runtime.ContainerMetadata{Name: "kube-proxy", Attempt: 10},
-			expected:      "/var/log/pods/d875aada-9920-11e8-bfef-0242ac11001e/kube-proxy/10.log",
-		},
-	}
-
-	for _, test := range testCases {
-		logPath := makeupLogPath(test.logDirectory, test.containerMeta)
-		if !reflect.DeepEqual(test.expected, logPath) {
-			t.Fatalf("unexpected logPath returned by makeupLogPath")
-		}
-	}
-}
-
 func Test_toCriContainerState(t *testing.T) {
 	testCases := []struct {
 		input    apitypes.Status
@@ -544,11 +519,12 @@ func Test_toCriContainerState(t *testing.T) {
 		{input: apitypes.StatusRunning, expected: runtime.ContainerState_CONTAINER_RUNNING},
 		{input: apitypes.StatusExited, expected: runtime.ContainerState_CONTAINER_EXITED},
 		{input: apitypes.StatusCreated, expected: runtime.ContainerState_CONTAINER_CREATED},
-		{input: apitypes.StatusPaused, expected: runtime.ContainerState_CONTAINER_UNKNOWN},
+		{input: apitypes.StatusPaused, expected: runtime.ContainerState_CONTAINER_PAUSE},
+		{input: "unknown", expected: runtime.ContainerState_CONTAINER_UNKNOWN},
 	}
 
 	for _, test := range testCases {
-		actual := toCriContainerState(test.input)
+		actual, _ := toCriContainerState(&apitypes.ContainerState{Status: test.input})
 		assert.Equal(t, test.expected, actual)
 	}
 }
@@ -726,6 +702,8 @@ func Test_modifyHostConfig(t *testing.T) {
 					SeccompProfilePath: mgr.ProfileDockerDefault,
 					ApparmorProfile:    mgr.ProfileRuntimeDefault,
 					NoNewPrivs:         true,
+					ReadonlyPaths:      []string{"/test/readyonly/path"},
+					MaskedPaths:        []string{"/test/masked/path"},
 				},
 				hostConfig: &apitypes.HostConfig{},
 			},
@@ -735,6 +713,35 @@ func Test_modifyHostConfig(t *testing.T) {
 				CapAdd:         []string{"fooAdd1", "fooAdd2"},
 				CapDrop:        []string{"fooDrop1", "fooDrop2"},
 				SecurityOpt:    []string{"no-new-privileges"},
+			},
+			wantErr: nil,
+		},
+		{
+			name: "ReadonlypathAndMaskedPathTest",
+			args: args{
+				sc: &runtime.LinuxContainerSecurityContext{
+					Privileged:     false,
+					ReadonlyRootfs: true,
+					Capabilities: &runtime.Capability{
+						AddCapabilities:  []string{"fooAdd1", "fooAdd2"},
+						DropCapabilities: []string{"fooDrop1", "fooDrop2"},
+					},
+					SeccompProfilePath: mgr.ProfileDockerDefault,
+					ApparmorProfile:    mgr.ProfileRuntimeDefault,
+					NoNewPrivs:         true,
+					ReadonlyPaths:      []string{"/test/readyonly/path"},
+					MaskedPaths:        []string{"/test/masked/path"},
+				},
+				hostConfig: &apitypes.HostConfig{},
+			},
+			wantHostConfig: &apitypes.HostConfig{
+				Privileged:     false,
+				ReadonlyRootfs: true,
+				CapAdd:         []string{"fooAdd1", "fooAdd2"},
+				CapDrop:        []string{"fooDrop1", "fooDrop2"},
+				SecurityOpt:    []string{"no-new-privileges"},
+				ReadonlyPaths:  []string{"/test/readyonly/path"},
+				MaskedPaths:    []string{"/test/masked/path"},
 			},
 			wantErr: nil,
 		},
@@ -1182,7 +1189,7 @@ func Test_imageToCriImage(t *testing.T) {
 				RepoTags:    repoDigests,
 				RepoDigests: repoDigests,
 				Size_:       uint64(1024),
-				Uid:         &runtime.Int64Value{},
+				Uid:         nil,
 				Username:    "foo",
 				Volumes:     runtimeVolumes,
 			},
@@ -1875,6 +1882,94 @@ func Test_toCNIPortMappings(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			if got := toCNIPortMappings(tt.args.criPortMappings); !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("toCNIPortMappings() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// CRI test: apply container config by annotation
+func Test_applyContainerConfigByAnnotation(t *testing.T) {
+	tests := []struct {
+		name       string
+		annotation map[string]string
+		checkFn    func(config *apitypes.ContainerConfig, hc *apitypes.HostConfig, uc *apitypes.UpdateConfig) bool
+		errMsg     string
+	}{
+		{
+			name: "normalMemorySwapTest",
+			annotation: map[string]string{
+				anno.MemorySwapExtendAnnotation: "200000000",
+			},
+			checkFn: func(config *apitypes.ContainerConfig, hc *apitypes.HostConfig, uc *apitypes.UpdateConfig) bool {
+				if hc.MemorySwap != 200000000 {
+					return false
+				}
+
+				if uc.MemorySwap != 200000000 {
+					return false
+				}
+
+				return true
+			},
+			errMsg: "",
+		},
+		{
+			name: "errorMemorySwapTest",
+			annotation: map[string]string{
+				anno.MemorySwapExtendAnnotation: "1g",
+			},
+			checkFn: func(config *apitypes.ContainerConfig, hc *apitypes.HostConfig, uc *apitypes.UpdateConfig) bool {
+				return false
+			},
+			errMsg: "failed to parse resources.memory-swap",
+		},
+		{
+			name: "normalPidsLimitTest",
+			annotation: map[string]string{
+				anno.PidsLimitExtendAnnotation: "100",
+			},
+			checkFn: func(config *apitypes.ContainerConfig, hc *apitypes.HostConfig, uc *apitypes.UpdateConfig) bool {
+				if hc.PidsLimit != 100 {
+					return false
+				}
+
+				if uc.PidsLimit != 100 {
+					return false
+				}
+
+				return true
+			},
+			errMsg: "",
+		},
+		{
+			name: "errorPidsLimitTest",
+			annotation: map[string]string{
+				anno.PidsLimitExtendAnnotation: "1m",
+			},
+			checkFn: func(config *apitypes.ContainerConfig, hc *apitypes.HostConfig, uc *apitypes.UpdateConfig) bool {
+				return false
+			},
+			errMsg: "failed to parse resources.pids-limit",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			config := &apitypes.ContainerConfig{}
+			hc := &apitypes.HostConfig{}
+			uc := &apitypes.UpdateConfig{}
+
+			err := applyContainerConfigByAnnotation(tt.annotation, config, hc, uc)
+			if tt.errMsg != "" {
+				assert.NotNil(t, err, "error should be %v", tt.errMsg)
+				if err != nil {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			}
+
+			if tt.errMsg == "" {
+				assert.Nil(t, err)
+				assert.True(t, tt.checkFn(config, hc, uc))
 			}
 		})
 	}

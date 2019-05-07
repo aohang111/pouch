@@ -31,7 +31,7 @@ crw-rw-rw-    1 root     root        1,   3 Jan  8 09:40 /dev/testnull
 ### Options
 
 ```
-      --annotation strings            Additional annotation for runtime
+      --annotation stringArray        Additional annotation for runtime
   -a, --attach                        Attach container's STDOUT and STDERR
       --blkio-weight uint16           Block IO (relative weight), between 10 and 1000, or 0 to disable
       --blkio-weight-device strings   Block IO weight (relative device weight), need CFQ IO Scheduler enable (default [])
@@ -57,7 +57,7 @@ crw-rw-rw-    1 root     root        1,   3 Jan  8 09:40 /dev/testnull
       --dns-search stringArray        Set DNS search domains
       --enableLxcfs                   Enable lxcfs for the container, only effective when enable-lxcfs switched on in Pouchd
       --entrypoint string             Overwrite the default ENTRYPOINT of the image
-  -e, --env stringArray               Set environment variables for container
+  -e, --env stringArray               Set environment variables for container('--env A=' means setting env A to empty, '--env B' means removing env B from container env inherited from image)
       --expose strings                Set expose container's ports
       --group-add strings             Add additional groups to join
   -h, --help                          help for run
@@ -66,15 +66,14 @@ crw-rw-rw-    1 root     root        1,   3 Jan  8 09:40 /dev/testnull
       --intel-rdt-l3-cbm string       Limit container resource for Intel RDT/CAT which introduced in Linux 4.10 kernel
   -i, --interactive                   Attach container's STDIN
       --ipc string                    IPC namespace to use
+      --kernel-memory string          Kernel memory limit (in bytes)
   -l, --label stringArray             Set labels for a container
       --log-driver string             Logging driver for the container (default "json-file")
       --log-opt stringArray           Log driver options
+      --mac-address string            Set mac address of container endpoint
   -m, --memory string                 Memory limit
-      --memory-extra int              Represent container's memory high water mark percentage, range in [0, 100]
-      --memory-force-empty-ctl int    Whether to reclaim page cache when deleting the cgroup of container
       --memory-swap string            Swap limit equal to memory + swap, '-1' to enable unlimited swap
       --memory-swappiness int         Container memory swappiness [0, 100]
-      --memory-wmark-ratio int        Represent this container's memory low water mark percentage, range in [0, 100]. The value of memory low water mark is memory.limit_in_bytes * MemoryWmarkRatio
       --name string                   Specify name of container
       --net strings                   Set networks to container
       --net-priority int              net priority
@@ -86,13 +85,13 @@ crw-rw-rw-    1 root     root        1,   3 Jan  8 09:40 /dev/testnull
       --pids-limit int                Set container pids limit
       --privileged                    Give extended privileges to the container
   -p, --publish strings               Set container ports mapping
+  -P, --publish-all                   Publish all exposed ports to random ports
       --quota-id string               Specified quota id, if id < 0, it means pouchd alloc a unique quota id
       --restart string                Restart policy to apply when container exits
       --rich                          Start container in rich container mode. (default false)
       --rich-mode string              Choose one rich container mode. dumb-init(default), systemd, sbin-init
       --rm                            Automatically remove the container after it exits
       --runtime string                OCI runtime to use for this container
-      --sche-lat-switch int           Whether to enable scheduler latency count in cpuacct
       --security-opt strings          Security Options
       --shm-size string               Size of /dev/shm, default value is 64MB
       --specific-id string            Specify id of container, length of id should be 64, characters of id should be in '0123456789abcdef'
@@ -101,7 +100,7 @@ crw-rw-rw-    1 root     root        1,   3 Jan  8 09:40 /dev/testnull
       --ulimit ulimit                 Set container ulimit (default [])
   -u, --user string                   UID
       --uts string                    UTS namespace to use
-  -v, --volume strings                Bind mount volumes to container, format is: [source:]<destination>[:mode], [source] can be volume or host's path, <destination> is container's path, [mode] can be "ro/rw/dr/rr/z/Z/nocopy/private/rprivate/slave/rslave/shared/rshared"
+  -v, --volume volumes                Bind mount volumes to container, format is: [source:]<destination>[:mode], [source] can be volume or host's path, <destination> is container's path, [mode] can be "ro/rw/dr/rr/z/Z/nocopy/private/rprivate/slave/rslave/shared/rshared" (default [])
       --volumes-from strings          set volumes from other containers, format is <container>[:mode]
   -w, --workdir string                Set the working directory in a container
 ```

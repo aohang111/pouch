@@ -23,15 +23,18 @@ $ pouch updatedaemon --debug=true
       --bridge-name string          update daemon bridge device
       --config-file string          specified config file for updating daemon (default "/etc/pouch/config.json")
       --default-gateway string      update daemon bridge default gateway
+      --disable-bridge              disable bridge network
       --exec-root-dir string        update exec root directory for network
       --fixed-cidr string           update daemon bridge fixed CIDR
   -h, --help                        help for updatedaemon
+      --home-dir string             update daemon home dir
       --image-proxy string          update daemon image proxy
       --ipforward                   udpate daemon with ipforward (default true)
       --iptables                    update daemon with iptables (default true)
       --label strings               update daemon labels
       --manager-white-list string   update daemon manager white list
       --offline                     just update daemon config file
+      --snapshotter string          update daemon snapshotter
       --userland-proxy              update daemon with userland proxy
 ```
 

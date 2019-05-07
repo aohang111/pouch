@@ -6,28 +6,29 @@ import (
 )
 
 func TestParseEnv(t *testing.T) {
-	type args struct {
-		env []string
-	}
 	tests := []struct {
 		name    string
-		args    args
-		want    map[string]string
+		args    string
+		want    string
 		wantErr bool
 	}{
-		// TODO: Add test cases.
-		{name: "test1", args: args{env: []string{"foo=bar"}}, want: map[string]string{"foo": "bar"}, wantErr: false},
-		{name: "test2", args: args{env: []string{"ErrorInfo"}}, want: nil, wantErr: true},
+		{"test single env", "foo=bar", "foo=bar", false},
+		{"test str with no =", "NOEQUALMARK", "NOEQUALMARK", false},
+		{"test multiple '=' envs", "A=1=2", "A=1=2", false},
+		{"test empty blank in value", "A=B C", "A=B C", false},
+		{"test only =", "=", "", true},
+		{"test empty env", "", "", true}, // empty map
+		{"test empty blank", "  ", "", true},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseEnv(tt.args.env)
+			got, err := parseEnv(tt.args)
 			if (err != nil) != tt.wantErr {
-				t.Errorf("ParseEnv() error = %v, wantErr %v", err, tt.wantErr)
+				t.Errorf("parseEnv() error = %v, wantErr %v", err, tt.wantErr)
 				return
 			}
 			if !reflect.DeepEqual(got, tt.want) {
-				t.Errorf("ParseEnv() = %v, want %v", got, tt.want)
+				t.Errorf("parseEnv() = %v, want %v", got, tt.want)
 			}
 		})
 	}

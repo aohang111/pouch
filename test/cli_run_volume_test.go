@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -90,22 +91,38 @@ func (suite *PouchRunVolumeSuite) TestRunWithVolumeCopyData(c *check.C) {
 		command.PouchRun("volume", "rm", volumeName).Assert(c, icmd.Success)
 	}()
 
+	// dirs under busybox image `/var` directory
+	// notes: there is a `/var/log` directory under rich mode container
+	expectedDirs := []string{"spool", "www"}
+
 	command.PouchRun("run", "-t", "-v", volumeName+":/var", "--name", containerName1, busyboxImage, "ls", "/var").Assert(c, icmd.Success)
 	defer DelContainerForceMultyTime(c, containerName1)
 	output1 := icmd.RunCommand("ls", DefaultVolumeMountPath+"/"+volumeName).Stdout()
-	lines := strings.Split(output1, "\n")
-	if !utils.StringInSlice(lines, "spool") {
-		c.Fatalf("expected \"spool\" directory under /var directory, but got %s", output1)
-	}
-	if !utils.StringInSlice(lines, "www") {
-		c.Fatalf("expected \"www\" directory under /var directory, but got %s", output1)
+
+	if !lsResultContains(output1, expectedDirs) {
+		c.Fatalf("expected \"%s\" directory under /var directory, but got %s",
+			strings.Join(expectedDirs, " "), output1)
 	}
 
 	command.PouchRun("run", "-t", "-v", hostdir+":/var", "--name", containerName2, busyboxImage, "ls", "/var").Assert(c, icmd.Success)
 	defer DelContainerForceMultyTime(c, containerName2)
 	defer icmd.RunCommand("rm", "-rf", hostdir)
 	output2 := icmd.RunCommand("ls", hostdir).Stdout()
-	c.Assert(output2, check.Equals, "")
+
+	if lsResultContains(output2, expectedDirs) {
+		c.Fatalf("volume mount in host bind mode, but \"%s\" exists", strings.Join(expectedDirs, " "))
+	}
+}
+
+func lsResultContains(res string, names []string) bool {
+	lines := strings.Split(res, "\n")
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if !utils.StringInSlice(lines, name) {
+			return false
+		}
+	}
+	return true
 }
 
 // TestRunWithHostFileVolume tests binding a host file as a volume into container.
@@ -145,7 +162,7 @@ func (suite *PouchRunVolumeSuite) TestRunWithVolumesFrom(c *check.C) {
 	res.Assert(c, icmd.Success)
 
 	// stop container1
-	command.PouchRun("stop", containerName1).Assert(c, icmd.Success)
+	command.PouchRun("stop", "-t", "1", containerName1).Assert(c, icmd.Success)
 
 	// run container2
 	res = command.PouchRun("run", "-d",
@@ -178,7 +195,7 @@ func (suite *PouchRunVolumeSuite) TestRunWithVolumesDestinationNotEmpty(c *check
 	// is `/opt/cni` which is not empty in the image. We should still be able to see
 	// the data in the image's `/opt/cni` when the volume is mounted.
 	// Details refer to: https://github.com/alibaba/pouch/issues/1739
-	image := "calico/cni:v3.1.3"
+	image := environment.CniRepo + ":" + environment.CniTag
 	containerName := "volumesDestinationNotEmpty"
 
 	// For the workdir of image `calico/cni:v3.1.3` is `/opt/cni/bin`,
@@ -210,7 +227,7 @@ func (suite *PouchRunVolumeSuite) TestRunWithVolumesFromWithDupclicate(c *check.
 	res.Assert(c, icmd.Success)
 
 	// stop container1
-	command.PouchRun("stop", containerName1).Assert(c, icmd.Success)
+	command.PouchRun("stop", "-t", "1", containerName1).Assert(c, icmd.Success)
 
 	// run container2
 	res = command.PouchRun("run", "-d",
@@ -240,6 +257,9 @@ func (suite *PouchRunVolumeSuite) TestRunWithVolumesFromWithDupclicate(c *check.
 func (suite *PouchRunVolumeSuite) TestRunWithVolumesFromDifferentSources(c *check.C) {
 	// TODO: build the image with volume
 	imageWithVolume := "registry.hub.docker.com/shaloulcy/busybox:with-volume"
+	if environment.IsAliKernel() {
+		imageWithVolume = "reg.docker.alibaba-inc.com/pouch/busybox:with-volume"
+	}
 	containerName1 := "TestRunWithVolumesFromImage"
 	containerName2 := "TestRunWithVolumesFromContainerAndImage"
 
@@ -302,12 +322,15 @@ func (suite *PouchRunVolumeSuite) TestRunWithDiskQuotaRegular(c *check.C) {
 	ret.Assert(c, icmd.Success)
 
 	ret = command.PouchRun("run",
-		"--disk-quota=1024m",
-		`--disk-quota=".*=512m"`,
+		`--disk-quota=/=1024m`,
 		`--disk-quota="/mnt/mount1=768m"`,
+		`--disk-quota="/mnt/mount4&/mnt/mount5=1280m"`,
+		`--disk-quota=".*=512m"`,
 		"-v", "/data/mount1:/mnt/mount1",
 		"-v", "/data/mount2:/mnt/mount2",
 		"-v", "diskquota-volume:/mnt/mount3",
+		"-v", "/data/mount4:/mnt/mount4",
+		"-v", "/data/mount5:/mnt/mount5",
 		"--name", containerName, busyboxImage, "df")
 	defer DelContainerForceMultyTime(c, containerName)
 	ret.Assert(c, icmd.Success)
@@ -318,6 +341,8 @@ func (suite *PouchRunVolumeSuite) TestRunWithDiskQuotaRegular(c *check.C) {
 	mount1Found := false
 	mount2Found := false
 	mount3Found := false
+	mount4Found := false
+	mount5Found := false
 	for _, line := range strings.Split(out, "\n") {
 		if strings.Contains(line, "/") &&
 			strings.Contains(line, "1048576") {
@@ -342,12 +367,26 @@ func (suite *PouchRunVolumeSuite) TestRunWithDiskQuotaRegular(c *check.C) {
 			mount3Found = true
 			continue
 		}
+
+		if strings.Contains(line, "/mnt/mount4") &&
+			strings.Contains(line, "1310720") {
+			mount4Found = true
+			continue
+		}
+
+		if strings.Contains(line, "/mnt/mount5") &&
+			strings.Contains(line, "1310720") {
+			mount5Found = true
+			continue
+		}
 	}
 
 	c.Assert(rootFound, check.Equals, true)
 	c.Assert(mount1Found, check.Equals, true)
 	c.Assert(mount2Found, check.Equals, true)
 	c.Assert(mount3Found, check.Equals, true)
+	c.Assert(mount4Found, check.Equals, true)
+	c.Assert(mount5Found, check.Equals, true)
 }
 
 // TestRunWithDiskQuota tests running container with --disk-quota.
@@ -369,6 +408,169 @@ func (suite *PouchRunVolumeSuite) TestRunWithDiskQuota(c *check.C) {
 	for _, line := range strings.Split(out, "\n") {
 		if strings.Contains(line, "/") &&
 			strings.Contains(line, "2048000") {
+			found = true
+			break
+		}
+	}
+
+	c.Assert(found, check.Equals, true)
+}
+
+func (suite *PouchRunVolumeSuite) TestRunCopyDataWithDR(c *check.C) {
+	cname := "TestRunCopyDataWithDR_Container"
+	vname := "TestRunCopyDataWithDR_Volume"
+
+	command.PouchRun("volume", "create", "-n", vname).Assert(c, icmd.Success)
+	defer command.PouchRun("volume", "rm", vname)
+
+	command.PouchRun("run", "-d", "--name", cname,
+		"-v", vname+":/var/spool:dr",
+		"-v", vname+":/var:dr",
+		"-v", vname+":/data", busyboxImage, "top").Assert(c, icmd.Success)
+	defer command.PouchRun("rm", "-vf", cname)
+
+	res := command.PouchRun("exec", cname, "ls", "/var")
+	res.Assert(c, icmd.Success)
+	if !strings.Contains(res.Stdout(), "spool") ||
+		!strings.Contains(res.Stdout(), "www") {
+		c.Fatal("no copy image data, miss spool and www directory")
+	}
+
+	res = command.PouchRun("exec", cname, "ls", "/var/spool")
+	res.Assert(c, icmd.Success)
+	if !strings.Contains(res.Stdout(), "mail") {
+		c.Fatal("no copy image data, miss mail directory")
+	}
+}
+
+func (suite *PouchRunVolumeSuite) TestRunVolumesFromWithDR(c *check.C) {
+	vName := "TestRunVolumesFromWithDR_Volume"
+	cName := "TestRunVolumesFromWithDR_Container"
+	cNameBak := "TestRunVolumesFromWithDR_Container_bak"
+
+	// create volume
+	command.PouchRun("volume", "create", "-n", vName).Assert(c, icmd.Success)
+	defer command.PouchRun("volume", "rm", vName)
+
+	// run bak container
+	command.PouchRun("run", "-d", "--name", cNameBak,
+		"-v", vName+":/var:dr",
+		"-v", vName+":/data", busyboxImage, "top").Assert(c, icmd.Success)
+
+	var bakRemoved bool
+	defer func() {
+		if !bakRemoved {
+			command.PouchRun("rm", "-vf", cNameBak)
+		}
+	}()
+
+	// stop bak container
+	command.PouchRun("stop", "-t", "1", cNameBak).Assert(c, icmd.Success)
+
+	// run new container with volumes-from
+	command.PouchRun("run", "-d", "--name", cName,
+		"--volumes-from", cNameBak, busyboxImage, "top").Assert(c, icmd.Success)
+	defer command.PouchRun("rm", "-vf", cName)
+
+	// remove bak container
+	command.PouchRun("rm", "-vf", cNameBak).Assert(c, icmd.Success)
+	bakRemoved = true
+
+	// check inspect mountpoint mode
+	ctr, err := apiClient.ContainerGet(context.Background(), cName)
+	if err != nil {
+		c.Fatalf("failed to get container info, err(%v)", err)
+	}
+
+	var found bool
+	for _, m := range ctr.Mounts {
+		if m.Destination == "/var" && m.Mode == "dr" {
+			found = true
+		}
+	}
+
+	c.Assert(found, check.Equals, true)
+}
+
+// TestRunWithQuotaID tests running container with --disk-quota and --quota-id.
+func (suite *PouchRunVolumeSuite) TestRunWithQuotaID(c *check.C) {
+	if !environment.IsDiskQuota() {
+		c.Skip("Host does not support disk quota")
+	}
+
+	cname := "TestRunWithQuotaID"
+	qid := "16777240"
+	ret := command.PouchRun("run",
+		"--disk-quota", "2000m",
+		"--quota-id", qid,
+		"--name", cname, busyboxImage, "df")
+
+	defer DelContainerForceMultyTime(c, cname)
+	ret.Assert(c, icmd.Success)
+
+	out := ret.Combined()
+
+	found := false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "/") &&
+			strings.Contains(line, "2048000") {
+			found = true
+			break
+		}
+	}
+
+	c.Assert(found, check.Equals, true)
+
+	ret = command.PouchRun("inspect", cname)
+	ret.Assert(c, icmd.Success)
+
+	out = ret.Stdout()
+	found = false
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "QuotaId") {
+			parts := strings.Split(line, "\"")
+			if len(parts) != 5 {
+				continue
+			}
+
+			if parts[3] == qid {
+				found = true
+				break
+			}
+		}
+	}
+	c.Assert(found, check.Equals, true)
+}
+
+// TestRunOverrideVolume tests bind volume should override default config
+func (suite *PouchRunVolumeSuite) TestRunOverrideVolume(c *check.C) {
+	cname := "TestRunOverrideVolume"
+	ret := command.PouchRun("run", "-d", "-v", "/sys/fs/cgroup:/sys/fs/cgroup",
+		"--name", cname, busyboxImage, "top")
+
+	defer DelContainerForceMultyTime(c, cname)
+	ret.Assert(c, icmd.Success)
+
+	output := command.PouchRun("inspect", "-f", "{{.ID}}", cname).Stdout()
+	containerID := strings.TrimSpace(output)
+
+	command.PouchRun("exec", cname, "ls", "/sys/fs/cgroup/memory/default/"+containerID).Assert(c, icmd.Success)
+}
+
+func (suite *PouchRunVolumeSuite) TestRunWithVolumesOpts(c *check.C) {
+	cname := "TestRunWithVolumesOpts"
+	res := command.PouchRun("run", "-d", "-v", "/tmp/test123:/mnt/test123:rslave,ro",
+		"--name", cname, busyboxImage, "top")
+
+	defer DelContainerForceMultyTime(c, cname)
+	res.Assert(c, icmd.Success)
+
+	res = command.PouchRun("exec", cname, "cat", "/proc/mounts")
+	res.Assert(c, icmd.Success)
+
+	found := false
+	for _, line := range strings.Split(res.Stdout(), "\n") {
+		if strings.Contains(line, "/mnt/test123") && strings.Contains(line, "ro") {
 			found = true
 			break
 		}

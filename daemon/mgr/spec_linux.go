@@ -7,10 +7,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"syscall"
 
 	"github.com/alibaba/pouch/apis/opts"
 	"github.com/alibaba/pouch/apis/types"
+	"github.com/alibaba/pouch/ctrd"
 
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/devices"
@@ -29,6 +29,9 @@ const (
 	ProfilePouchDefault = "pouch/default"
 	// ProfileNameUnconfined is a string indicating one should run a pod/containerd without a security profile.
 	ProfileNameUnconfined = "unconfined"
+
+	// defaultCgroupParent is default cgroup parent.
+	defaultCgroupParent = "pouch"
 )
 
 // Setup linux-platform-sepecific specification.
@@ -39,18 +42,21 @@ func populatePlatform(ctx context.Context, c *Container, specWrapper *SpecWrappe
 	}
 
 	// same with containerd use. or make it a variable
-	cgroupsParent := "default"
-	if c.HostConfig.CgroupParent != "" {
-		cgroupsParent = c.HostConfig.CgroupParent
+	// set default cgroup parent
+	cgroupsParent := "/default"
+	if specWrapper.useSystemd {
+		cgroupsParent = "system.slice"
 	}
 
-	// cgroupsPath must be absolute path
-	// call filepath.Clean is to avoid bad
-	// path just like../../../.../../BadPath
-	if !filepath.IsAbs(cgroupsParent) {
-		cgroupsParent = filepath.Clean("/" + cgroupsParent)
+	if c.HostConfig.CgroupParent != "" {
+		cgroupsParent = filepath.Clean(c.HostConfig.CgroupParent)
 	}
-	s.Linux.CgroupsPath = filepath.Join(cgroupsParent, c.ID)
+
+	if specWrapper.useSystemd {
+		s.Linux.CgroupsPath = cgroupsParent + ":" + defaultCgroupParent + ":" + c.ID
+	} else {
+		s.Linux.CgroupsPath = filepath.Clean(filepath.Join("/", cgroupsParent, c.ID))
+	}
 
 	s.Linux.Sysctl = c.HostConfig.Sysctls
 
@@ -63,9 +69,18 @@ func populatePlatform(ctx context.Context, c *Container, specWrapper *SpecWrappe
 	// setup something depend on privileged authority
 	if !c.HostConfig.Privileged {
 		s.Linux.MountLabel = c.MountLabel
+
+		// if MaskedPaths or ReadonlyPaths are set, we will use them, otherwise using the default values.
+		if len(c.HostConfig.MaskedPaths) > 0 {
+			s.Linux.MaskedPaths = c.HostConfig.MaskedPaths
+		}
+		if len(c.HostConfig.ReadonlyPaths) > 0 {
+			s.Linux.ReadonlyPaths = c.HostConfig.ReadonlyPaths
+		}
 	} else {
-		s.Linux.ReadonlyPaths = nil
+		// MaskedPaths and ReadonlyPaths have default values, we should reset them when privileged be set
 		s.Linux.MaskedPaths = nil
+		s.Linux.ReadonlyPaths = nil
 	}
 
 	// start to setup linux seccomp
@@ -111,23 +126,23 @@ func setupResource(ctx context.Context, c *Container, s *specs.Spec) error {
 
 // setupResource creates linux blkio resource spec.
 func setupBlkio(ctx context.Context, r types.Resources, s *specs.Spec) error {
-	weightDevice, err := getWeightDevice(r.BlkioWeightDevice)
+	weightDevice, err := ctrd.GetWeightDevice(r.BlkioWeightDevice)
 	if err != nil {
 		return err
 	}
-	readBpsDevice, err := getThrottleDevice(r.BlkioDeviceReadBps)
+	readBpsDevice, err := ctrd.GetThrottleDevice(r.BlkioDeviceReadBps)
 	if err != nil {
 		return err
 	}
-	writeBpsDevice, err := getThrottleDevice(r.BlkioDeviceWriteBps)
+	writeBpsDevice, err := ctrd.GetThrottleDevice(r.BlkioDeviceWriteBps)
 	if err != nil {
 		return err
 	}
-	readIOpsDevice, err := getThrottleDevice(r.BlkioDeviceReadIOps)
+	readIOpsDevice, err := ctrd.GetThrottleDevice(r.BlkioDeviceReadIOps)
 	if err != nil {
 		return err
 	}
-	writeIOpsDevice, err := getThrottleDevice(r.BlkioDeviceWriteIOps)
+	writeIOpsDevice, err := ctrd.GetThrottleDevice(r.BlkioDeviceWriteIOps)
 	if err != nil {
 		return err
 	}
@@ -142,46 +157,6 @@ func setupBlkio(ctx context.Context, r types.Resources, s *specs.Spec) error {
 	}
 
 	return nil
-}
-
-func getWeightDevice(devs []*types.WeightDevice) ([]specs.LinuxWeightDevice, error) {
-	var stat syscall.Stat_t
-	var weightDevice []specs.LinuxWeightDevice
-
-	for _, dev := range devs {
-		if err := syscall.Stat(dev.Path, &stat); err != nil {
-			return nil, err
-		}
-
-		d := specs.LinuxWeightDevice{
-			Weight: &dev.Weight,
-		}
-		d.Major = int64(stat.Rdev / 256)
-		d.Minor = int64(stat.Rdev % 256)
-		weightDevice = append(weightDevice, d)
-	}
-
-	return weightDevice, nil
-}
-
-func getThrottleDevice(devs []*types.ThrottleDevice) ([]specs.LinuxThrottleDevice, error) {
-	var stat syscall.Stat_t
-	var ThrottleDevice []specs.LinuxThrottleDevice
-
-	for _, dev := range devs {
-		if err := syscall.Stat(dev.Path, &stat); err != nil {
-			return nil, err
-		}
-
-		d := specs.LinuxThrottleDevice{
-			Rate: dev.Rate,
-		}
-		d.Major = int64(stat.Rdev / 256)
-		d.Minor = int64(stat.Rdev % 256)
-		ThrottleDevice = append(ThrottleDevice, d)
-	}
-
-	return ThrottleDevice, nil
 }
 
 // setupResource creates linux cpu resource spec
@@ -230,6 +205,11 @@ func setupMemory(ctx context.Context, r types.Resources, s *specs.Spec) {
 	if r.OomKillDisable != nil {
 		v := bool(*r.OomKillDisable)
 		memory.DisableOOMKiller = &v
+	}
+
+	if r.KernelMemory > 0 {
+		v := r.KernelMemory
+		memory.Kernel = &v
 	}
 
 	s.Linux.Resources.Memory = memory
@@ -445,9 +425,12 @@ func setupNetworkNamespace(ctx context.Context, c *Container, specWrapper *SpecW
 		}
 
 		ns.Path = fmt.Sprintf("/proc/%d/ns/net", origContainer.State.Pid)
+	} else if IsNetNS(networkMode) {
+		ns.Path = strings.SplitN(networkMode, ":", 2)[1]
 	} else if IsHost(networkMode) {
 		ns.Path = c.NetworkSettings.SandboxKey
 	}
+
 	setNamespace(s, ns)
 
 	for _, ns := range s.Linux.Namespaces {

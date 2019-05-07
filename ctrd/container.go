@@ -24,8 +24,8 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	"github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/leases"
-	"github.com/containerd/containerd/linux/runctypes"
 	"github.com/containerd/containerd/oci"
+	"github.com/containerd/containerd/runtime/linux/runctypes"
 	imagespec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
@@ -45,6 +45,7 @@ type containerPack struct {
 	// client is to record which stream client the container connect with
 	client        *WrapperClient
 	skipStopHooks bool
+	l             sync.RWMutex
 }
 
 // ContainerStats returns stats of the container.
@@ -112,7 +113,7 @@ func (c *Client) execContainer(ctx context.Context, process *Process) error {
 			},
 		).Debugf("creating cio (withStdin=%v, withTerminal=%v)", withStdin, withTerminal)
 
-		fifoset, err := containerio.NewCioFIFOSet(execID, withStdin, withTerminal)
+		fifoset, err := containerio.NewFIFOSet(execID, withStdin, withTerminal)
 		if err != nil {
 			return nil, err
 		}
@@ -292,9 +293,30 @@ func (c *Client) recoverContainer(ctx context.Context, id string, io *containeri
 		return errors.Wrapf(err, "failed to load container(%s)", id)
 	}
 
-	task, err := lc.Task(ctx, func(fset *cio.FIFOSet) (cio.IO, error) {
-		return c.attachIO(fset, io.InitContainerIO)
-	})
+	var (
+		timeout = 5 * time.Second
+		ch      = make(chan error, 1)
+		task    containerd.Task
+	)
+
+	// for normal shim, this operation should be end less than 1 second,
+	// we give 5 second timeout to believe the shim get locked internal,
+	// return error since we do not want a hang shim affect daemon start
+	pctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	go func() {
+		task, err = lc.Task(pctx, func(fset *cio.FIFOSet) (cio.IO, error) {
+			return c.attachIO(fset, io.InitContainerIO)
+		})
+		ch <- err
+	}()
+
+	select {
+	case <-time.After(timeout):
+		return errors.Wrap(errtypes.ErrTimeout, "failed to connect to shim")
+	case err = <-ch:
+	}
+
 	if err != nil {
 		if !errdefs.IsNotFound(err) {
 			return errors.Wrap(err, "failed to get task")
@@ -341,7 +363,7 @@ func (c *Client) destroyContainer(ctx context.Context, id string, timeout int64)
 		return nil, fmt.Errorf("failed to get a containerd grpc client: %v", err)
 	}
 
-	ctx = leases.WithLease(ctx, wrapperCli.lease.ID())
+	ctx = leases.WithLease(ctx, wrapperCli.lease.ID)
 
 	if !c.lock.TrylockWithRetry(ctx, id) {
 		return nil, errtypes.ErrLockfailed
@@ -355,9 +377,13 @@ func (c *Client) destroyContainer(ctx context.Context, id string, timeout int64)
 
 	// if you call DestroyContainer to stop a container, will skip the hooks.
 	// the caller need to execute the all hooks.
+	pack.l.Lock()
 	pack.skipStopHooks = true
+	pack.l.Unlock()
 	defer func() {
+		pack.l.Lock()
 		pack.skipStopHooks = false
+		pack.l.Unlock()
 	}()
 
 	waitExit := func() *Message {
@@ -366,6 +392,7 @@ func (c *Client) destroyContainer(ctx context.Context, id string, timeout int64)
 
 	var msg *Message
 
+	// TODO: set task request timeout by context timeout
 	if err := pack.task.Kill(ctx, syscall.SIGTERM, containerd.WithKillAll); err != nil {
 		if !errdefs.IsNotFound(err) {
 			return nil, errors.Wrap(err, "failed to kill task")
@@ -385,11 +412,22 @@ func (c *Client) destroyContainer(ctx context.Context, id string, timeout int64)
 		}
 		msg = waitExit()
 	}
-	if err := msg.RawError(); err != nil && errtypes.IsTimeout(err) {
+
+	// ignore the error is stop time out
+	// TODO: how to design the stop error is time out?
+	if err := msg.RawError(); err != nil && !errtypes.IsTimeout(err) {
 		return nil, err
 	}
 
 clean:
+	// for normal destroy process, task.Delete() and container.Delete()
+	// is done in ctrd/watch.go, after task exit. clean is task effect only
+	// when unexcepted error happened in task exit process.
+	if _, err := pack.task.Delete(ctx); err != nil {
+		if !errdefs.IsNotFound(err) {
+			logrus.Errorf("failed to delete task %s again: %v", pack.id, err)
+		}
+	}
 	if err := pack.container.Delete(ctx); err != nil {
 		if !errdefs.IsNotFound(err) {
 			return msg, errors.Wrap(err, "failed to delete container")
@@ -503,10 +541,12 @@ func (c *Client) createContainer(ctx context.Context, ref, id, checkpointDir str
 
 	// create container
 	options := []containerd.NewContainerOpts{
+		containerd.WithSnapshotter(CurrentSnapshotterName(ctx)),
 		containerd.WithContainerLabels(container.Labels),
 		containerd.WithRuntime(fmt.Sprintf("io.containerd.runtime.v1.%s", runtime.GOOS), &runctypes.RuncOptions{
-			Runtime:     container.Runtime,
-			RuntimeRoot: runtimeRoot,
+			Runtime:       container.Runtime,
+			RuntimeRoot:   runtimeRoot,
+			SystemdCgroup: container.UseSystemd,
 		}),
 	}
 
@@ -583,7 +623,7 @@ func (c *Client) createTask(ctx context.Context, id, checkpointDir string, conta
 	task, err := container.NewTask(ctx, func(_ string) (cio.IO, error) {
 		logrus.WithField("container", cntrID).Debugf("creating cio (withStdin=%v, withTerminal=%v)", withStdin, withTerminal)
 
-		fifoset, err := containerio.NewCioFIFOSet(execID, withStdin, withTerminal)
+		fifoset, err := containerio.NewFIFOSet(execID, withStdin, withTerminal)
 		if err != nil {
 			return nil, err
 		}
@@ -695,7 +735,7 @@ func (c *Client) waitContainer(ctx context.Context, id string) (types.ContainerW
 		return types.ContainerWaitOKBody{}, fmt.Errorf("failed to get a containerd grpc client: %v", err)
 	}
 
-	ctx = leases.WithLease(ctx, wrapperCli.lease.ID())
+	ctx = leases.WithLease(ctx, wrapperCli.lease.ID)
 
 	waitExit := func() *Message {
 		return c.ProbeContainer(ctx, id, -1*time.Second)
@@ -734,7 +774,7 @@ func (c *Client) CreateCheckpoint(ctx context.Context, id string, checkpointDir 
 
 	var opts []containerd.CheckpointTaskOpts
 	if exit {
-		opts = append(opts, containerd.WithExit)
+		opts = append(opts, withExitShimV1CheckpointTaskOpts())
 	}
 	checkpoint, err := pack.task.Checkpoint(ctx, opts...)
 	if err != nil {
@@ -748,7 +788,7 @@ func (c *Client) CreateCheckpoint(ctx context.Context, id string, checkpointDir 
 }
 
 func applyCheckpointImage(ctx context.Context, client *containerd.Client, checkpoint containerd.Image, checkpointDir string) error {
-	b, err := content.ReadBlob(ctx, client.ContentStore(), checkpoint.Target().Digest)
+	b, err := content.ReadBlob(ctx, client.ContentStore(), checkpoint.Target())
 	if err != nil {
 		return errors.Wrapf(err, "failed to retrieve checkpoint data")
 	}
@@ -768,7 +808,7 @@ func applyCheckpointImage(ctx context.Context, client *containerd.Client, checkp
 		return errors.Wrapf(err, "invalid checkpoint")
 	}
 
-	rat, err := client.ContentStore().ReaderAt(ctx, cpDesc.Digest)
+	rat, err := client.ContentStore().ReaderAt(ctx, *cpDesc)
 	if err != nil {
 		return errors.Wrapf(err, "failed to get checkpoint reader")
 	}
@@ -782,7 +822,7 @@ func applyCheckpointImage(ctx context.Context, client *containerd.Client, checkp
 }
 
 func writeContent(ctx context.Context, mediaType, ref string, r io.Reader, client *containerd.Client) (*containerdtypes.Descriptor, error) {
-	writer, err := client.ContentStore().Writer(ctx, ref, 0, "")
+	writer, err := client.ContentStore().Writer(ctx, content.WithRef(ref))
 	if err != nil {
 		return nil, err
 	}
@@ -831,10 +871,10 @@ func withCheckpointOpt(checkpoint *containerdtypes.Descriptor) containerd.NewTas
 }
 
 // InitStdio allows caller to handle any initialize job.
-type InitStdio func(dio *containerio.DirectIO) (cio.IO, error)
+type InitStdio func(dio *cio.DirectIO) (cio.IO, error)
 
-func (c *Client) createIO(fifoSet *containerio.CioFIFOSet, cntrID, procID string, closeStdinCh <-chan struct{}, initstdio InitStdio) (cio.IO, error) {
-	cdio, err := containerio.NewDirectIO(context.Background(), fifoSet)
+func (c *Client) createIO(fifoSet *cio.FIFOSet, cntrID, procID string, closeStdinCh <-chan struct{}, initstdio InitStdio) (cio.IO, error) {
+	cdio, err := cio.NewDirectIO(context.Background(), fifoSet)
 	if err != nil {
 		return nil, err
 	}
@@ -883,12 +923,12 @@ func (c *Client) attachIO(fifoSet *cio.FIFOSet, initstdio InitStdio) (cio.IO, er
 		return nil, fmt.Errorf("cannot attach to existing fifos")
 	}
 
-	cdio, err := containerio.NewDirectIO(context.Background(), &containerio.CioFIFOSet{
+	cdio, err := cio.NewDirectIO(context.Background(), &cio.FIFOSet{
 		Config: cio.Config{
 			Terminal: fifoSet.Terminal,
-			Stdin:    fifoSet.In,
-			Stdout:   fifoSet.Out,
-			Stderr:   fifoSet.Err,
+			Stdin:    fifoSet.Stdin,
+			Stdout:   fifoSet.Stdout,
+			Stderr:   fifoSet.Stderr,
 		},
 	})
 	if err != nil {

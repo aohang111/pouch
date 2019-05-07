@@ -48,7 +48,7 @@ func (suite *PouchCreateSuite) TestCreateName(c *check.C) {
 	c.Assert(res.Combined(), check.Equals, fmt.Sprintf("%s\n", digStr))
 }
 
-// TestCreateNameByImageID is to verify the correctness of creating contaier with specified name by image id.
+// TestCreateNameByImageID is to verify the correctness of creating container with specified name by image id.
 func (suite *PouchCreateSuite) TestCreateNameByImageID(c *check.C) {
 	name := "create-normal-by-image-id"
 
@@ -300,25 +300,64 @@ func (suite *PouchCreateSuite) TestCreateEnableLxcfs(c *check.C) {
 func (suite *PouchCreateSuite) TestCreateWithEnv(c *check.C) {
 	name := "TestCreateWithEnv"
 
-	res := command.PouchRun("create", "--name", name, "-e TEST=true", busyboxImage)
+	env1 := "TEST1=true"
+	env2 := "TEST2="    // should be in inspect result as TEST2=, and still in container's real env as TEST2=
+	env3 := "TEST3"     // should not in container's real env
+	env4 := "TEST4=a b" // valid
+	env5 := "TEST5=a=b" // valid
+	res := command.PouchRun("run", "-d",
+		"--name", name,
+		"-e", env1,
+		"-e", env2,
+		"-e", env3,
+		"-e", env4,
+		"-e", env5,
+		busyboxImage,
+		"top")
 	defer DelContainerForceMultyTime(c, name)
 
 	res.Assert(c, icmd.Success)
 
-	output := command.PouchRun("inspect", name).Stdout()
+	envs, err := inspectFilter(name, ".Config.Env")
+	c.Assert(err, check.IsNil)
 
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
+	// check if these envs are in inspect result of container.
+	if !strings.Contains(envs, env1) {
+		c.Fatalf("container env in inspect result should have %s in %s while no\n", env1, envs)
+	}
+	if !strings.Contains(envs, env2) {
+		c.Fatalf("container env in inspect result should have %s in %s while no\n", env2, envs)
+	}
+	if strings.Contains(envs, env3) {
+		c.Fatalf("container env in inspect result should not have %s in %s, while it has\n", env3, envs)
+	}
+	if !strings.Contains(envs, env4) {
+		c.Fatalf("container env in inspect result should have %s in %s while no\n", env4, envs)
+	}
+	if !strings.Contains(envs, env5) {
+		c.Fatalf("container env in inspect result should have %s in %s while no\n", env5, envs)
 	}
 
-	ok := false
-	for _, v := range result[0].Config.Env {
-		if strings.Contains(v, "TEST=true") {
-			ok = true
-		}
+	// check if these envs are in the real container envs
+	ret := command.PouchRun("exec", name, "env")
+	envs = ret.Stdout()
+
+	if !strings.Contains(envs, env1) {
+		c.Fatalf("container's runtime env should have %s in %s while no\n", env1, envs)
 	}
-	c.Assert(ok, check.Equals, true)
+	if !strings.Contains(envs, env2) {
+		c.Fatalf("container's runtime env should have %s in %s while no\n", env2, envs)
+	}
+	//  container's runtime env should not have env3
+	if strings.Contains(envs, env3) {
+		c.Fatalf("container's runtime env should not have %s in %s while it is there\n", env3, envs)
+	}
+	if !strings.Contains(envs, env4) {
+		c.Fatalf("container's runtime env should have %s in %s while no\n", env4, envs)
+	}
+	if !strings.Contains(envs, env5) {
+		c.Fatalf("container's runtime env should have %s in %s while no\n", env5, envs)
+	}
 }
 
 // TestCreateWithWorkDir tests creating container with a workdir works.
@@ -349,7 +388,7 @@ func (suite *PouchCreateSuite) TestCreateWithUser(c *check.C) {
 	c.Assert(userConfig, check.Equals, user)
 }
 
-// TestCreateWithIntelRdt tests creating container with Intel Rdt.
+// TestCreateWithIntelRdt tests creating container with Intel RDT.
 func (suite *PouchCreateSuite) TestCreateWithIntelRdt(c *check.C) {
 	name := "TestCreateWithIntelRdt"
 	intelRdt := "L3:<cache_id0>=<cbm0>"
@@ -362,32 +401,7 @@ func (suite *PouchCreateSuite) TestCreateWithIntelRdt(c *check.C) {
 	c.Assert(intelRdtL3Cbm, check.Equals, intelRdt)
 }
 
-// TestCreateWithAliOSMemoryOptions tests creating container with AliOS container isolation options.
-func (suite *PouchCreateSuite) TestCreateWithAliOSMemoryOptions(c *check.C) {
-	name := "TestCreateWithAliOSMemoryOptions"
-	memoryWmarkRatio := "30"
-	memoryExtra := "50"
-
-	res := command.PouchRun("create", "--name", name, "--memory-wmark-ratio",
-		memoryWmarkRatio, "--memory-extra", memoryExtra, "--memory-force-empty-ctl", "1",
-		"--sche-lat-switch", "1", busyboxImage)
-	defer DelContainerForceMultyTime(c, name)
-
-	res.Assert(c, icmd.Success)
-
-	output := command.PouchRun("inspect", name).Stdout()
-
-	result := []types.ContainerJSON{}
-	if err := json.Unmarshal([]byte(output), &result); err != nil {
-		c.Errorf("failed to decode inspect output: %v", err)
-	}
-	c.Assert(*result[0].HostConfig.MemoryWmarkRatio, check.Equals, int64(30))
-	c.Assert(*result[0].HostConfig.MemoryExtra, check.Equals, int64(50))
-	c.Assert(result[0].HostConfig.MemoryForceEmptyCtl, check.Equals, int64(1))
-	c.Assert(result[0].HostConfig.ScheLatSwitch, check.Equals, int64(1))
-}
-
-// TestCreateWithOOMOption tests creating container with oom options.
+// TestCreateWithOOMOption tests creating container with OOM options.
 func (suite *PouchCreateSuite) TestCreateWithOOMOption(c *check.C) {
 	name := "TestCreateWithOOMOption"
 	oomScore := "100"
@@ -412,7 +426,7 @@ func (suite *PouchCreateSuite) TestCreateWithOOMOption(c *check.C) {
 func (suite *PouchCreateSuite) TestCreateWithAnnotation(c *check.C) {
 	cname := "TestCreateWithAnnotation"
 	res := command.PouchRun("create", "--annotation", "a=b", "--annotation", "foo=bar",
-		"--name", cname, busyboxImage)
+		"--annotation", "k1=v1,v2", "--name", cname, busyboxImage)
 	defer DelContainerForceMultyTime(c, cname)
 	res.Assert(c, icmd.Success)
 
@@ -431,6 +445,7 @@ func (suite *PouchCreateSuite) TestCreateWithAnnotation(c *check.C) {
 
 	c.Assert(util.PartialEqual(annotationStr, "a=b"), check.IsNil)
 	c.Assert(util.PartialEqual(annotationStr, "foo=bar"), check.IsNil)
+	c.Assert(util.PartialEqual(annotationStr, "k1=v1,v2"), check.IsNil)
 }
 
 // TestCreateWithUlimit tests creating container with annotation.
@@ -465,17 +480,17 @@ func (suite *PouchCreateSuite) TestCreateWithPidsLimit(c *check.C) {
 func (suite *PouchCreateSuite) TestCreateWithNonExistImage(c *check.C) {
 	cname := "TestCreateWithNonExistImage"
 	// we should use a non-used image, since containerd not remove image immediately.
-	image := "docker.io/library/alpine"
-	res := command.PouchRun("create", "--name", cname, image)
-	res.Assert(c, icmd.Success)
+	DelImageForceOk(c, busyboxImage)
+	command.PouchRun("create", "--name", cname, busyboxImage).Assert(c, icmd.Success)
 }
 
 // TestCreateWithNonExistImage tests running container with image not exist.
 func (suite *PouchCreateSuite) TestCreateWithNvidiaConfig(c *check.C) {
 	cname := "TestCreateWithNvidiaConfig"
-	image := "docker.io/library/alpine"
-	res := command.PouchRun("create", "--name", cname, "--nvidia-capabilities", "all", "--nvidia-visible-devs", "none", image)
-	res.Assert(c, icmd.Success)
+	command.PouchRun("create", "--name", cname,
+		"--nvidia-capabilities", "all",
+		"--nvidia-visible-devs", "none", busyboxImage).Assert(c, icmd.Success)
+	defer command.PouchRun("rm", "-vf", cname)
 
 	output := command.PouchRun("inspect", cname).Stdout()
 	result := []types.ContainerJSON{}
@@ -491,9 +506,9 @@ func (suite *PouchCreateSuite) TestCreateWithNvidiaConfig(c *check.C) {
 // TestCreateWithNonExistImage tests running container with image not exist.
 func (suite *PouchCreateSuite) TestCreateWithoutNvidiaConfig(c *check.C) {
 	cname := "TestCreateWithoutNvidiaConfig"
-	image := "docker.io/library/alpine"
-	res := command.PouchRun("create", "--name", cname, image)
-	res.Assert(c, icmd.Success)
+
+	command.PouchRun("create", "--name", cname, busyboxImage).Assert(c, icmd.Success)
+	defer command.PouchRun("rm", "-vf", cname)
 
 	output := command.PouchRun("inspect", cname).Stdout()
 	result := []types.ContainerJSON{}

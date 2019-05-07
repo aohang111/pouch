@@ -10,7 +10,6 @@ import (
 	"github.com/alibaba/pouch/pkg/jsonstream"
 
 	"github.com/containerd/containerd"
-	eventsapi "github.com/containerd/containerd/api/services/events/v1"
 	containerdtypes "github.com/containerd/containerd/api/types"
 	ctrdmetaimages "github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/mount"
@@ -26,6 +25,8 @@ type APIClient interface {
 
 	Version(ctx context.Context) (containerd.Version, error)
 	Cleanup() error
+	Plugins(ctx context.Context, filters []string) ([]Plugin, error)
+	CheckSnapshotterValid(snapshotter string, allowMultiSnapshotter bool) error
 }
 
 // ContainerAPIClient provides access to containerd container features.
@@ -64,8 +65,6 @@ type ContainerAPIClient interface {
 	SetExitHooks(hooks ...func(string, *Message, func() error) error)
 	// SetExecExitHooks specified the handlers of exec process exit.
 	SetExecExitHooks(hooks ...func(string, *Message) error)
-	// Events subscribe containerd events through an event subscribe client.
-	Events(ctx context.Context, ef ...string) (eventsapi.Events_SubscribeClient, error)
 	// SetEventsHooks specified the methods to handle the containerd events.
 	SetEventsHooks(hooks ...func(context.Context, string, string, map[string]string) error)
 }
@@ -78,16 +77,18 @@ type ImageAPIClient interface {
 	GetImage(ctx context.Context, ref string) (containerd.Image, error)
 	// ListImages returns the list of containerd.Image filtered by the given conditions.
 	ListImages(ctx context.Context, filter ...string) ([]containerd.Image, error)
-	// PullImage pulls image by the given reference.
-	PullImage(ctx context.Context, ref string, authConfig *types.AuthConfig, stream *jsonstream.JSONStream) (containerd.Image, error)
+	// FetchImage fetchs image content by the given reference.
+	FetchImage(ctx context.Context, ref string, authConfig *types.AuthConfig, stream *jsonstream.JSONStream) (containerd.Image, error)
 	// RemoveImage removes the image by the given reference.
 	RemoveImage(ctx context.Context, ref string) error
 	// ImportImage creates a set of images by tarstream.
-	ImportImage(ctx context.Context, importer ctrdmetaimages.Importer, reader io.Reader) ([]containerd.Image, error)
+	ImportImage(ctx context.Context, reader io.Reader, opts ...containerd.ImportOpt) ([]containerd.Image, error)
 	// SaveImage saves image to tarstream
 	SaveImage(ctx context.Context, exporter ctrdmetaimages.Exporter, ref string) (io.ReadCloser, error)
 	// Commit commits an image from a container.
 	Commit(ctx context.Context, config *CommitConfig) (digest.Digest, error)
+	// PushImage pushes a image to registry
+	PushImage(ctx context.Context, ref string, authConfig *types.AuthConfig, out io.Writer) error
 }
 
 // SnapshotAPIClient provides access to containerd snapshot features
@@ -104,8 +105,9 @@ type SnapshotAPIClient interface {
 	// GetSnapshotUsage returns the resource usage of an active or committed snapshot
 	// excluding the usage of parent snapshots.
 	GetSnapshotUsage(ctx context.Context, id string) (snapshots.Usage, error)
-	// WalkSnapshot walk all snapshots. For each snapshot, the function will be called.
-	WalkSnapshot(ctx context.Context, fn func(context.Context, snapshots.Info) error) error
+	// WalkSnapshot walk all snapshots in specific snapshotter. If not set specific snapshotter,
+	// it will be set to current snapshotter. For each snapshot, the function will be called.
+	WalkSnapshot(ctx context.Context, snapshotter string, fn func(context.Context, snapshots.Info) error) error
 	// CreateCheckpoint creates a checkpoint from a running container
 	CreateCheckpoint(ctx context.Context, id string, checkpointDir string, exit bool) error
 }

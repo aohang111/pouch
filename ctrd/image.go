@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"net/http"
 	"sync"
 	"time"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/containerd/containerd/errdefs"
 	ctrdmetaimages "github.com/containerd/containerd/images"
 	"github.com/containerd/containerd/remotes"
+	"github.com/containerd/containerd/remotes/docker"
 	"github.com/opencontainers/go-digest"
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -143,8 +143,8 @@ func (c *Client) saveImage(ctx context.Context, exporter ctrdmetaimages.Exporter
 // ImportImage creates a set of images by tarstream.
 //
 // NOTE: One tar may have several manifests.
-func (c *Client) ImportImage(ctx context.Context, importer ctrdmetaimages.Importer, reader io.Reader) ([]containerd.Image, error) {
-	imgs, err := c.importImage(ctx, importer, reader)
+func (c *Client) ImportImage(ctx context.Context, reader io.Reader, opts ...containerd.ImportOpt) ([]containerd.Image, error) {
+	imgs, err := c.importImage(ctx, reader, opts...)
 	if err != nil {
 		return imgs, convertCtrdErr(err)
 	}
@@ -154,7 +154,7 @@ func (c *Client) ImportImage(ctx context.Context, importer ctrdmetaimages.Import
 // importImage creates a set of images by tarstream.
 //
 // NOTE: One tar may have several manifests.
-func (c *Client) importImage(ctx context.Context, importer ctrdmetaimages.Importer, reader io.Reader) ([]containerd.Image, error) {
+func (c *Client) importImage(ctx context.Context, reader io.Reader, opts ...containerd.ImportOpt) ([]containerd.Image, error) {
 	wrapperCli, err := c.Get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get a containerd grpc client: %v", err)
@@ -162,28 +162,93 @@ func (c *Client) importImage(ctx context.Context, importer ctrdmetaimages.Import
 
 	// NOTE: The import will store the data into boltdb. But the unpack may
 	// fail. It is not transaction.
-	imgs, err := wrapperCli.client.Import(ctx, importer, reader)
+	imgs, err := wrapperCli.client.Import(ctx, reader, opts...)
 	if err != nil {
 		return nil, err
 	}
 
+	var (
+		res        = make([]containerd.Image, 0, len(imgs))
+		snaphotter = CurrentSnapshotterName(ctx)
+	)
+
 	for _, img := range imgs {
-		err = img.Unpack(ctx, containerd.DefaultSnapshotter)
+		image := containerd.NewImage(wrapperCli.client, img)
+
+		err = image.Unpack(ctx, snaphotter)
 		if err != nil {
 			return nil, err
 		}
+
+		res = append(res, image)
 	}
-	return imgs, nil
+	return res, nil
 }
 
-// PullImage downloads an image from the remote repository.
-func (c *Client) PullImage(ctx context.Context, ref string, authConfig *types.AuthConfig, stream *jsonstream.JSONStream) (containerd.Image, error) {
+// PushImage pushes image to registry
+func (c *Client) PushImage(ctx context.Context, ref string, authConfig *types.AuthConfig, out io.Writer) error {
+	wrapperCli, err := c.Get(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get a containerd grpc client: %v", err)
+	}
+
+	img, err := wrapperCli.client.GetImage(ctx, ref)
+	if err != nil {
+		return convertCtrdErr(err)
+	}
+
+	pushTracker := docker.NewInMemoryTracker()
+
+	resolver, err := c.getResolver(authConfig, ref, docker.ResolverOptions{
+		Tracker: pushTracker,
+	})
+	if err != nil {
+		return err
+	}
+
+	ongoing := jsonstream.NewPushJobs(pushTracker)
+	handler := ctrdmetaimages.HandlerFunc(func(ctx context.Context, desc ocispec.Descriptor) ([]ocispec.Descriptor, error) {
+		ongoing.Add(remotes.MakeRefKey(ctx, desc))
+		return nil, nil
+	})
+
+	// fetch progress status, then send to client via out channel.
+	stream := jsonstream.New(out, nil)
+	pctx, cancelProgress := context.WithCancel(ctx)
+	wait := make(chan struct{})
+	go func() {
+		jsonstream.PushProcess(pctx, ongoing, stream)
+		close(wait)
+	}()
+
+	err = wrapperCli.client.Push(ctx, ref, img.Target(),
+		containerd.WithResolver(resolver),
+		containerd.WithImageHandler(handler))
+
+	cancelProgress()
+	<-wait
+
+	defer func() {
+		stream.Close()
+		stream.Wait()
+	}()
+	if err != nil {
+		return err
+	}
+
+	logrus.Infof("push image %s successfully", ref)
+
+	return nil
+}
+
+// FetchImage fetches image content from the remote repository.
+func (c *Client) FetchImage(ctx context.Context, ref string, authConfig *types.AuthConfig, stream *jsonstream.JSONStream) (containerd.Image, error) {
 	wrapperCli, err := c.Get(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get a containerd grpc client: %v", err)
 	}
 
-	resolver, err := resolver(authConfig)
+	resolver, err := c.getResolver(authConfig, ref, docker.ResolverOptions{})
 	if err != nil {
 		return nil, err
 	}
@@ -191,7 +256,6 @@ func (c *Client) PullImage(ctx context.Context, ref string, authConfig *types.Au
 	ongoing := newJobs(ref)
 
 	options := []containerd.RemoteOpt{
-		containerd.WithPullUnpack,
 		containerd.WithSchema1Conversion,
 		containerd.WithResolver(resolver),
 	}
@@ -218,33 +282,23 @@ func (c *Client) PullImage(ctx context.Context, ref string, authConfig *types.Au
 	}()
 
 	// start to pull image.
-	img, err := c.pullImage(ctx, wrapperCli, ref, options)
+	img, err := c.fetchImage(ctx, wrapperCli, ref, options)
 
 	// cancel fetch progress before handle error.
 	cancelProgress()
-	defer stream.Close()
 
 	// wait fetch progress to finish.
 	<-wait
 
 	if err != nil {
-		// Send Error information to client through stream
-		message := jsonstream.JSONMessage{
-			Error: &jsonstream.JSONError{
-				Code:    http.StatusInternalServerError,
-				Message: err.Error(),
-			},
-			ErrorMessage: err.Error(),
-		}
-		stream.WriteObject(message)
 		return nil, err
 	}
 
-	logrus.Infof("success to pull image: %s", img.Name())
+	logrus.Infof("success to fetch image: %s", img.Name())
 	return img, nil
 }
 
-func (c *Client) pullImage(ctx context.Context, wrapperCli *WrapperClient, ref string, options []containerd.RemoteOpt) (containerd.Image, error) {
+func (c *Client) fetchImage(ctx context.Context, wrapperCli *WrapperClient, ref string, options []containerd.RemoteOpt) (containerd.Image, error) {
 	img, err := wrapperCli.client.Pull(ctx, ref, options...)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to pull image")

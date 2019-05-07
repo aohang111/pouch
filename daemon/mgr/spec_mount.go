@@ -7,8 +7,10 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 
 	"github.com/alibaba/pouch/apis/types"
+	"github.com/pkg/errors"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
@@ -39,10 +41,7 @@ func clearReadonly(m *specs.Mount) {
 	m.Options = opts
 }
 
-// setupMounts create mount spec.
-func setupMounts(ctx context.Context, c *Container, s *specs.Spec) error {
-	var mounts []specs.Mount
-	// Override the default mounts which are duplicate with user defined ones.
+func overrideDefaultMount(mounts []specs.Mount, c *Container, s *specs.Spec) ([]specs.Mount, error) {
 	for _, sm := range s.Mounts {
 		dup := false
 		for _, cm := range c.Mounts {
@@ -54,23 +53,14 @@ func setupMounts(ctx context.Context, c *Container, s *specs.Spec) error {
 		if dup {
 			continue
 		}
-		if sm.Destination == "/dev/shm" && c.HostConfig.ShmSize != nil {
-			sm.Options = append(sm.Options, fmt.Sprintf("size=%s", strconv.FormatInt(*c.HostConfig.ShmSize, 10)))
-		}
+
 		mounts = append(mounts, sm)
 	}
-	// TODO: we can suggest containerd to add the cgroup into the default spec.
-	mounts = append(mounts, specs.Mount{
-		Destination: "/sys/fs/cgroup",
-		Type:        "cgroup",
-		Source:      "cgroup",
-		Options:     []string{"ro", "nosuid", "noexec", "nodev"},
-	})
 
-	if c.HostConfig == nil {
-		return nil
-	}
-	// user defined mount
+	return mounts, nil
+}
+
+func mergeContainerMount(mounts []specs.Mount, c *Container, s *specs.Spec) ([]specs.Mount, error) {
 	for _, mp := range c.Mounts {
 		if trySetupNetworkMount(mp, c) {
 			// ignore the network mount, we will handle it later.
@@ -80,7 +70,7 @@ func setupMounts(ctx context.Context, c *Container, s *specs.Spec) error {
 		// check duplicate mountpoint
 		for _, sm := range mounts {
 			if sm.Destination == mp.Destination {
-				return fmt.Errorf("duplicate mount point: %s", mp.Destination)
+				return nil, fmt.Errorf("duplicate mount point: %s", mp.Destination)
 			}
 		}
 
@@ -109,10 +99,6 @@ func setupMounts(ctx context.Context, c *Container, s *specs.Spec) error {
 
 		// TODO: support copy data.
 
-		if mp.Destination == "/dev/shm" && c.HostConfig.ShmSize != nil {
-			opts = []string{fmt.Sprintf("size=%s", strconv.FormatInt(*c.HostConfig.ShmSize, 10))}
-		}
-
 		mounts = append(mounts, specs.Mount{
 			Source:      mp.Source,
 			Destination: mp.Destination,
@@ -126,18 +112,54 @@ func setupMounts(ctx context.Context, c *Container, s *specs.Spec) error {
 		mounts = append(mounts, generateNetworkMounts(c)...)
 	}
 
-	s.Mounts = sortMounts(mounts)
+	return mounts, nil
+}
 
-	if c.HostConfig.Privileged {
-		if !s.Root.Readonly {
-			// Clear readonly for /sys.
-			for i := range s.Mounts {
-				if s.Mounts[i].Destination == "/sys" {
-					clearReadonly(&s.Mounts[i])
+// setupMounts create mount spec.
+func setupMounts(ctx context.Context, c *Container, s *specs.Spec) error {
+	var (
+		mounts []specs.Mount
+		err    error
+	)
+
+	// Override the default mounts which are duplicate with user defined ones.
+	mounts, err = overrideDefaultMount(mounts, c, s)
+	if err != nil {
+		return errors.Wrap(err, "failed to override default spec mounts")
+	}
+
+	// user defined mount
+	mounts, err = mergeContainerMount(mounts, c, s)
+	if err != nil {
+		return errors.Wrap(err, "failed to merge container mounts")
+	}
+
+	// modify share memory size, and change rw mode for privileged mode.
+	for i := range mounts {
+		if mounts[i].Destination == "/dev/shm" && c.HostConfig.ShmSize != nil &&
+			*c.HostConfig.ShmSize != 0 {
+			for idx, v := range mounts[i].Options {
+				if strings.Contains(v, "size=") {
+					mounts[i].Options[idx] = fmt.Sprintf("size=%s",
+						strconv.FormatInt(*c.HostConfig.ShmSize, 10))
 				}
 			}
 		}
+
+		if c.HostConfig.Privileged {
+			// Clear readonly for /sys.
+			if mounts[i].Destination == "/sys" && !s.Root.Readonly {
+				clearReadonly(&mounts[i])
+			}
+
+			// Clear readonly for cgroup
+			if mounts[i].Type == "cgroup" {
+				clearReadonly(&mounts[i])
+			}
+		}
 	}
+
+	s.Mounts = sortMounts(mounts)
 	return nil
 }
 

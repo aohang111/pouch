@@ -59,13 +59,12 @@ func (suite *APIImageListSuite) TestImageListDigest(c *check.C) {
 
 // TestImageListFilter tests listing images with filter.
 func (suite *APIImageListSuite) TestImageListFilter(c *check.C) {
+	PullImage(c, busyboxImage)
+
 	q := url.Values{}
 
-	repoDigest := "registry.hub.docker.com/library/busybox@sha256:141c253bc4c3fd0a201d32dc1f493bcf3fff003b6df416dea4f41046e0f37d47"
-	repoTag := "registry.hub.docker.com/library/busybox:1.28"
-
 	f := filters.NewArgs()
-	f.Add("reference", repoTag)
+	f.Add("reference", busyboxImage)
 	filterJSON, err := filters.ToParam(f)
 	c.Assert(err, check.IsNil)
 
@@ -87,16 +86,14 @@ func (suite *APIImageListSuite) TestImageListFilter(c *check.C) {
 	c.Assert(got[0].Architecture, check.NotNil)
 	c.Assert(got[0].Size, check.NotNil)
 	c.Assert(got[0].Os, check.NotNil)
-	c.Assert(reflect.DeepEqual(got[0].RepoTags, []string{repoTag}), check.Equals, true)
-	c.Assert(reflect.DeepEqual(got[0].RepoDigests, []string{repoDigest}), check.Equals, true)
+	c.Assert(reflect.DeepEqual(got[0].RepoTags, []string{busyboxImage}), check.Equals, true)
 }
 
 // TestImageListInvalidFilter tests listing images with invalid filter.
 func (suite *APIImageListSuite) TestImageListInvalidFilter(c *check.C) {
-	repoTag := "registry.hub.docker.com/library/busybox:1.28"
 	q := url.Values{}
 	f := filters.NewArgs()
-	f.Add("after", repoTag)
+	f.Add("after", busyboxImage)
 	filterJSON, err := filters.ToParam(f)
 	c.Assert(err, check.IsNil)
 	q.Add("filters", filterJSON)

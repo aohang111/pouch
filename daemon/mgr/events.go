@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/alibaba/pouch/apis/types"
+
 	"github.com/docker/libnetwork"
 )
 
@@ -105,7 +106,37 @@ func (mgr *ContainerManager) publishContainerdEvent(ctx context.Context, id, act
 		return err
 	}
 
+	c.Lock()
+	defer c.Unlock()
+
 	mgr.LogContainerEventWithAttributes(ctx, c, action, attributes)
+
+	return nil
+}
+
+// updateContainerState update container's state according to the containerd events.
+func (mgr *ContainerManager) updateContainerState(ctx context.Context, id, action string, attributes map[string]string) error {
+	c, err := mgr.container(id)
+	if err != nil {
+		return err
+	}
+
+	c.Lock()
+	defer c.Unlock()
+
+	dirty := true
+	switch action {
+	case "oom":
+		c.SetStatusOOM()
+	default:
+		dirty = false
+	}
+
+	if dirty {
+		if err := mgr.Store.Put(c); err != nil {
+			return err
+		}
+	}
 
 	return nil
 }

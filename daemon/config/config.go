@@ -22,8 +22,12 @@ import (
 )
 
 const (
-	// CgroupfsDriverType refers to daemon's cgroup driver.
-	CgroupfsDriverType = "cgroupfs"
+	// CgroupfsDriver is cgroupfs driver
+	CgroupfsDriver = "cgroupfs"
+	// CgroupSystemdDriver is systemd driver
+	CgroupSystemdDriver = "systemd"
+	// DefaultCgroupDriver is default cgroups driver
+	DefaultCgroupDriver = CgroupfsDriver
 )
 
 // Config refers to daemon's whole configurations.
@@ -44,9 +48,6 @@ type Config struct {
 
 	// Server listening address.
 	Listen []string `json:"listen,omitempty"`
-
-	// ListenCRI is the listening address which serves CRI.
-	ListenCRI string `json:"listen-cri,omitempty"`
 
 	// Debug refers to the log mode.
 	Debug bool `json:"debug,omitempty"`
@@ -117,14 +118,29 @@ type Config struct {
 
 	// DefaultNamespace is passed to containerd.
 	DefaultNamespace string `json:"default-namespace,omitempty"`
+
+	// Snapshotter is passed to containerd, default to overlayfs
+	Snapshotter string `json:"snapshotter,omitempty"`
+
+	// AllowMultiSnapshotter allows multi snapshotter, default false
+	AllowMultiSnapshotter bool `json:"allow-multi-snapshotter,omitempty"`
+
+	// CgroupDriver sets cgroup driver for all containers
+	CgroupDriver string `json:"cgroup-driver,omitempty"`
+
+	// InsecureRegistries sets insecure registries to allow to pull
+	// insecure registries.
+	InsecureRegistries []string `json:"insecure-registries,omitempty"`
 }
 
 // GetCgroupDriver gets cgroup driver used in runc.
 func (cfg *Config) GetCgroupDriver() string {
-	// current pouchd only supports directly managing cgroupfs.
-	// TODO: add 'systemd' to make systemd manage cgroupfs rather than directly using it.
-	// In the future we will support this config in the daemon configuration.
-	return CgroupfsDriverType
+	return cfg.CgroupDriver
+}
+
+// UseSystemd tells whether use systemd cgroup driver
+func (cfg *Config) UseSystemd() bool {
+	return cfg.CgroupDriver == CgroupSystemdDriver
 }
 
 // Validate validates the user input config.
@@ -158,7 +174,12 @@ func (cfg *Config) Validate() error {
 		cfg.Runtimes[cfg.DefaultRuntime] = types.Runtime{Path: cfg.DefaultRuntime}
 	}
 
-	return nil
+	// if cgroup driver is empty, use default cgroup driver
+	if cfg.CgroupDriver == "" {
+		cfg.CgroupDriver = DefaultCgroupDriver
+	}
+
+	return validateCgroupDriver(cfg.CgroupDriver)
 }
 
 //MergeConfigurations merges flagSet flags and config file flags into Config.
@@ -271,4 +292,13 @@ func getConflictConfigurations(flagSet *pflag.FlagSet, fileFlags map[string]inte
 // merge flagSet and config file into cfg
 func mergeConfigurations(src *Config, dest *Config) error {
 	return utils.Merge(src, dest)
+}
+
+// validateCgroupDriver validates cgroup driver
+func validateCgroupDriver(driver string) error {
+	if driver == CgroupfsDriver || driver == CgroupSystemdDriver {
+		return nil
+	}
+
+	return fmt.Errorf("invalid cgroup driver: %s, valid driver is cgroupfs or systemd", driver)
 }

@@ -1,8 +1,13 @@
 package mgr
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/alibaba/pouch/apis/types"
@@ -12,8 +17,12 @@ import (
 	"github.com/containerd/typeurl"
 	"github.com/docker/docker/pkg/ioutils"
 	"github.com/go-openapi/strfmt"
+	"github.com/opencontainers/runc/libcontainer/system"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
+
+const nanoSecondsPerSecond = 1e9
 
 // StreamStats gets the stats from containerd side and send back to caller as a stream.
 func (mgr *ContainerManager) StreamStats(ctx context.Context, name string, config *ContainerStatsConfig) error {
@@ -23,28 +32,46 @@ func (mgr *ContainerManager) StreamStats(ctx context.Context, name string, confi
 	}
 
 	outStream := config.OutStream
-	if (!c.IsRunning() || c.IsRestarting()) && !config.Stream {
-		return json.NewEncoder(outStream).Encode(&types.ContainerStats{
-			Name: c.Name,
-			ID:   c.ID,
-		})
+
+	var preCPUStats *types.CPUStats
+
+	wrapContainerStats := func(metricMeta *containerdtypes.Metric, metric *cgroups.Metrics) (*types.ContainerStats, error) {
+		stats := toContainerStats(c, metricMeta, metric)
+
+		systemCPUUsage, err := getSystemCPUUsage()
+		if err != nil {
+			return nil, err
+		}
+		stats.PrecpuStats = preCPUStats
+		stats.CPUStats.SyetemCPUUsage = systemCPUUsage
+		preCPUStats = stats.CPUStats
+
+		networkStat, err := mgr.NetworkMgr.GetNetworkStats(c.NetworkSettings.SandboxID)
+		if err != nil {
+			// --net=none or disconnect from network, the sandbox will be nil
+			logrus.Debugf("failed to get network stats from container %s: %v", name, err)
+		}
+		stats.Networks = networkStat
+		return stats, nil
 	}
 
-	if c.IsRunning() && !config.Stream {
+	// just collect stats data once.
+	if !config.Stream {
 		metrics, stats, err := mgr.Stats(ctx, name)
 		if err != nil {
 			return err
 		}
-		containerStat := toContainerStats(metrics.Timestamp, stats)
+		containerStat, err := wrapContainerStats(metrics, stats)
+		if err != nil {
+			return errors.Errorf("failed to wrap the containerStat: %v", err)
+		}
 		return json.NewEncoder(outStream).Encode(containerStat)
 	}
 
-	if config.Stream {
-		wf := ioutils.NewWriteFlusher(outStream)
-		defer wf.Close()
-		wf.Flush()
-		outStream = wf
-	}
+	wf := ioutils.NewWriteFlusher(outStream)
+	defer wf.Close()
+	wf.Flush()
+	outStream = wf
 
 	enc := json.NewEncoder(outStream)
 
@@ -60,14 +87,12 @@ func (mgr *ContainerManager) StreamStats(ctx context.Context, name string, confi
 				return err
 			}
 
-			// metrics may be nil if the container is not running,
-			// so just ignore it and try get the metrics next time.
-			if metrics != nil {
-				containerStat := toContainerStats(metrics.Timestamp, stats)
-
-				if err := enc.Encode(containerStat); err != nil {
-					return err
-				}
+			containerStat, err := wrapContainerStats(metrics, stats)
+			if err != nil {
+				return errors.Errorf("failed to wrap the containerStat: %v", err)
+			}
+			if err := enc.Encode(containerStat); err != nil {
+				return err
 			}
 
 			time.Sleep(DefaultStatsInterval)
@@ -83,15 +108,14 @@ func (mgr *ContainerManager) Stats(ctx context.Context, name string) (*container
 	}
 
 	c.Lock()
-	ID := c.ID
-	c.Unlock()
+	defer c.Unlock()
 
-	// only get metrics when the container is running
-	if !(c.IsRunning() || c.IsPaused()) {
+	// empty stats for not-running container.
+	if !c.IsRunningOrPaused() {
 		return nil, nil, nil
 	}
 
-	metric, err := mgr.Client.ContainerStats(ctx, ID)
+	metric, err := mgr.Client.ContainerStats(ctx, c.ID)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -104,9 +128,21 @@ func (mgr *ContainerManager) Stats(ctx context.Context, name string) (*container
 	return metric, v.(*cgroups.Metrics), nil
 }
 
-func toContainerStats(time time.Time, metric *cgroups.Metrics) *types.ContainerStats {
+func toContainerStats(container *Container, metricMeta *containerdtypes.Metric, metric *cgroups.Metrics) *types.ContainerStats {
+	if metricMeta == nil {
+		return &types.ContainerStats{
+			ID:          container.ID,
+			Name:        container.Name,
+			PidsStats:   &types.PidsStats{},
+			CPUStats:    &types.CPUStats{},
+			BlkioStats:  &types.BlkioStats{},
+			MemoryStats: &types.MemoryStats{},
+		}
+	}
 	return &types.ContainerStats{
-		Read: strfmt.DateTime(time),
+		Read: strfmt.DateTime(metricMeta.Timestamp),
+		ID:   container.ID,
+		Name: container.Name,
 		PidsStats: &types.PidsStats{
 			Current: metric.Pids.Current,
 		},
@@ -117,16 +153,22 @@ func toContainerStats(time time.Time, metric *cgroups.Metrics) *types.ContainerS
 				UsageInKernelmode: metric.CPU.Usage.Kernel,
 				UsageInUsermode:   metric.CPU.Usage.User,
 			},
-			// Add SyetemCPUUsage?
-			// SyetemCPUUsage: metric.CPU.Usage.SyetemCPUUsage,
 			ThrottlingData: &types.ThrottlingData{
 				Periods:          metric.CPU.Throttling.Periods,
 				ThrottledPeriods: metric.CPU.Throttling.ThrottledPeriods,
 				ThrottledTime:    metric.CPU.Throttling.ThrottledTime,
 			},
 		},
-		PrecpuStats: &types.CPUStats{},
-		BlkioStats:  &types.BlkioStats{},
+		BlkioStats: &types.BlkioStats{
+			IoServiceBytesRecursive: toContainerBlkioStatsEntry(metric.Blkio.IoServiceBytesRecursive),
+			IoServicedRecursive:     toContainerBlkioStatsEntry(metric.Blkio.IoServicedRecursive),
+			IoQueueRecursive:        toContainerBlkioStatsEntry(metric.Blkio.IoQueuedRecursive),
+			IoServiceTimeRecursive:  toContainerBlkioStatsEntry(metric.Blkio.IoServiceTimeRecursive),
+			IoWaitTimeRecursive:     toContainerBlkioStatsEntry(metric.Blkio.IoWaitTimeRecursive),
+			IoMergedRecursive:       toContainerBlkioStatsEntry(metric.Blkio.IoMergedRecursive),
+			IoTimeRecursive:         toContainerBlkioStatsEntry(metric.Blkio.IoTimeRecursive),
+			SectorsRecursive:        toContainerBlkioStatsEntry(metric.Blkio.SectorsRecursive),
+		},
 		MemoryStats: &types.MemoryStats{
 			Stats: map[string]uint64{
 				"total_pgmajfault":          metric.Memory.TotalPgMajFault,
@@ -165,4 +207,63 @@ func toContainerStats(time time.Time, metric *cgroups.Metrics) *types.ContainerS
 			Limit:    metric.Memory.Usage.Limit,
 		},
 	}
+}
+
+func toContainerBlkioStatsEntry(statEntrys []*cgroups.BlkIOEntry) []*types.BlkioStatEntry {
+	blkioStatEntrys := []*types.BlkioStatEntry{}
+	for _, item := range statEntrys {
+		blkioStatEntrys = append(blkioStatEntrys, &types.BlkioStatEntry{
+			Major: item.Major,
+			Minor: item.Minor,
+			Op:    item.Op,
+			Value: item.Value,
+		})
+	}
+	return blkioStatEntrys
+}
+
+// getSystemCPUUsage returns the host system's cpu usage in
+// nanoseconds. An error is returned if the format of the underlying
+// file does not match.
+//
+// Uses /proc/stat defined by POSIX. Looks for the cpu
+// statistics line and then sums up the first seven fields
+// provided. See `man 5 proc` for details on specific field
+// information.
+func getSystemCPUUsage() (uint64, error) {
+	f, err := os.Open("/proc/stat")
+	if err != nil {
+		return 0, err
+	}
+	bufReader := bufio.NewReaderSize(nil, 128)
+	defer func() {
+		bufReader.Reset(nil)
+		f.Close()
+	}()
+	bufReader.Reset(f)
+
+	for {
+		line, err := bufReader.ReadString('\n')
+		if err != nil {
+			break
+		}
+		parts := strings.Fields(line)
+		switch parts[0] {
+		case "cpu":
+			if len(parts) < 8 {
+				return 0, fmt.Errorf("invalid number of cpu fields")
+			}
+			var totalClockTicks uint64
+			for _, i := range parts[1:8] {
+				v, err := strconv.ParseUint(i, 10, 64)
+				if err != nil {
+					return 0, fmt.Errorf("unable to convert value %s to int: %s", i, err)
+				}
+				totalClockTicks += v
+			}
+			return (totalClockTicks * nanoSecondsPerSecond) /
+				uint64(system.GetClockTicks()), nil
+		}
+	}
+	return 0, fmt.Errorf("invalid stat format, fail to parse the '/proc/stat' file")
 }

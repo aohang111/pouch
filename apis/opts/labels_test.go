@@ -9,8 +9,8 @@ import (
 func TestParseLabels(t *testing.T) {
 	type result struct {
 		labels map[string]string
-		err    error
 	}
+
 	type TestCase struct {
 		input    []string
 		expected result
@@ -23,7 +23,6 @@ func TestParseLabels(t *testing.T) {
 				labels: map[string]string{
 					"a": "b",
 				},
-				err: nil,
 			},
 		},
 		{
@@ -32,7 +31,6 @@ func TestParseLabels(t *testing.T) {
 				labels: map[string]string{
 					"a": "b",
 				},
-				err: nil,
 			},
 		},
 		{
@@ -42,22 +40,49 @@ func TestParseLabels(t *testing.T) {
 				labels: map[string]string{
 					"a": "bb",
 				},
-				err: nil,
+			},
+		},
+		// only input key
+		{
+			input: []string{"a"},
+			expected: result{
+				labels: map[string]string{
+					"a": "",
+				},
 			},
 		},
 		{
-			input: []string{"ThisIsALableWithoutEqualMark"},
+			input: []string{"a="},
 			expected: result{
 				labels: map[string]string{
-                                        "ThisIsALableWithoutEqualMark": "",
-                                },
+					"a": "",
+				},
+			},
+		},
+		{
+			input: []string{"a=b=c"},
+			expected: result{
+				labels: map[string]string{
+					"a": "b=c",
+				},
+			},
+		},
+		{
+			input: []string{},
+			expected: result{
+				labels: map[string]string{},
+			},
+		},
+		{
+			input: nil,
+			expected: result{
+				labels: map[string]string{},
 			},
 		},
 	}
 
 	for _, testCase := range testCases {
-		labels, err := ParseLabels(testCase.input)
-		assert.Equal(t, testCase.expected.err, err)
+		labels := ParseLabels(testCase.input)
 		assert.Equal(t, testCase.expected.labels, labels)
 	}
 }

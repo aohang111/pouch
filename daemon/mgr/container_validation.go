@@ -3,6 +3,7 @@ package mgr
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -11,6 +12,8 @@ import (
 	"github.com/alibaba/pouch/daemon/logger/jsonfile"
 	"github.com/alibaba/pouch/daemon/logger/syslog"
 	"github.com/alibaba/pouch/pkg/system"
+	"github.com/alibaba/pouch/pkg/utils"
+	"github.com/alibaba/pouch/storage/quota"
 
 	"github.com/docker/go-units"
 	"github.com/pkg/errors"
@@ -27,18 +30,25 @@ var (
 	// all: all GPUs will be accessible
 	supportedDrivers = map[string]*struct{}{"compute": nil, "compat32": nil, "graphics": nil, "utility": nil, "video": nil, "display": nil}
 
-	errInvalidDevice = errors.New("invalid nvidia device")
-	errInvalidDriver = errors.New("invalid nvidia driver capability")
+	errInvalidDevice    = errors.New("invalid nvidia device")
+	errInvalidDriver    = errors.New("invalid nvidia driver capability")
+	errInvalidDiskQuota = errors.New("invalid disk quota")
 
 	// commonLogOpts the option which should be validated in common such as mode, max-buffer-size.
 	commonLogOpts = map[string]bool{
 		"mode":            true,
 		"max-buffer-size": true,
+		logRootDirKey:     true,
 	}
 )
 
 // validateConfig validates container config
 func (mgr *ContainerManager) validateConfig(c *Container, update bool) ([]string, error) {
+	// validates rich mode
+	if err := validateRichMode(c); err != nil {
+		return nil, err
+	}
+
 	// validates container hostconfig
 	hostConfig := c.HostConfig
 	warnings := make([]string, 0)
@@ -83,6 +93,75 @@ func (mgr *ContainerManager) validateConfig(c *Container, update bool) ([]string
 	}
 
 	return warnings, nil
+}
+
+// validateDiskQuota is used to validate disk quota config
+func (mgr *ContainerManager) validateDiskQuota(config *types.ContainerCreateConfig) error {
+	if config == nil {
+		return errors.Errorf("invalid request, create config is nil")
+	}
+
+	if config.DiskQuota == nil {
+		if quota.IsSetQuotaID(config.QuotaID) {
+			return errors.Wrap(errInvalidDiskQuota, "set QuotaID without DiskQuota")
+		}
+		return nil
+	}
+
+	quotaMaps := config.DiskQuota
+	if len(quotaMaps) > 1 && quota.IsSetQuotaID(config.QuotaID) {
+		return errors.Wrap(errInvalidDiskQuota, `QuotaID only used to set one disk quota, `+
+			`such as: "/=10G" or "/path1=10G" or ".*=10G"`)
+	}
+
+	for key := range quotaMaps {
+		if key == "" {
+			return errors.Wrap(errInvalidDiskQuota, "quota can not be nil string")
+		}
+
+		paths := strings.Split(key, "&")
+		if len(paths) <= 1 {
+			continue
+		}
+
+		for _, path := range paths {
+			if !filepath.IsAbs(path) {
+				return errors.Wrapf(errInvalidDiskQuota,
+					"(%s) is invalid path in set quota(%s)", path, key)
+			}
+		}
+	}
+
+	return nil
+}
+
+// validateRichMode verifies rich mode parameters
+func validateRichMode(c *Container) error {
+	richModes := []string{
+		types.ContainerConfigRichModeDumbInit,
+		types.ContainerConfigRichModeSbinInit,
+		types.ContainerConfigRichModeSystemd,
+	}
+
+	if !c.Config.Rich && c.Config.RichMode != "" {
+		return fmt.Errorf("must first enable rich mode, then specify a rich mode type")
+	}
+	// check rich mode
+	if c.Config.RichMode != "" && !utils.StringInSlice(richModes, c.Config.RichMode) {
+		return fmt.Errorf("not supported rich mode: %v", c.Config.RichMode)
+	}
+
+	// must use privileged when use systemd rich mode
+	if c.Config.RichMode == types.ContainerConfigRichModeSystemd && !c.HostConfig.Privileged {
+		return fmt.Errorf("must using privileged mode when create systemd rich container")
+	}
+
+	// if enables rich mode but not specified rich mode type, assign to dumb-init
+	if c.Config.Rich && c.Config.RichMode == "" {
+		c.Config.RichMode = types.ContainerConfigRichModeDumbInit
+	}
+
+	return nil
 }
 
 // validateResource verifies cgroup resources
@@ -257,7 +336,10 @@ func (mgr *ContainerManager) validateLogConfig(c *Container) error {
 	case types.LogConfigLogDriverNone, types.LogConfigLogDriverJSONFile:
 		return jsonfile.ValidateLogOpt(restOpts)
 	case types.LogConfigLogDriverSyslog:
-		info := mgr.convContainerToLoggerInfo(c)
+		info, err := mgr.convContainerToLoggerInfo(c)
+		if err != nil {
+			return err
+		}
 		return syslog.ValidateSyslogOption(info)
 	default:
 		return fmt.Errorf("not support (%v) log driver yet", logCfg.LogDriver)

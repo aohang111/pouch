@@ -37,8 +37,8 @@ func (suite *PouchRunDNSSuite) TestRunWithUserDefinedNetwork(c *check.C) {
 	// Create a user-defined network
 	command.PouchRun("network", "create", "--name", cname,
 		"-d", "bridge",
-		"--gateway", GateWay,
-		"--subnet", Subnet).Assert(c, icmd.Success)
+		"--gateway", testGateWay,
+		"--subnet", testSubnet).Assert(c, icmd.Success)
 	defer command.PouchRun("network", "remove", cname)
 
 	// Assign the user-defined network to a container
@@ -61,7 +61,7 @@ func (suite *PouchRunDNSSuite) TestRunWithBridgeNetwork(c *check.C) {
 	res.Assert(c, icmd.Success)
 	defer DelContainerForceMultyTime(c, cname)
 
-	hostRes := icmd.RunCommand("cat", "/etc/resolv.conf")
+	hostRes := icmd.RunCommand("bash", "-c", "cat /etc/resolv.conf | grep -v 127.0.0.1")
 	hostRes.Assert(c, icmd.Success)
 
 	c.Assert(res.Stdout(), check.Equals, hostRes.Stdout())

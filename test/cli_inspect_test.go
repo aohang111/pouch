@@ -70,11 +70,25 @@ func (suite *PouchInspectSuite) TestInspectCreateAndStartedFormat(c *check.C) {
 	res = command.PouchRun("start", name)
 	res.Assert(c, icmd.Success)
 
-	// Inspect LogPath, LogPath should not be empty after container's start.
-	// by default, the container has log type of json-file.
+	// Inspect LogPath, HostnamePath, HostsPath, ResolvConfPath, Privileged
 	output = command.PouchRun("inspect", "-f", "{{.LogPath}}", name).Stdout()
 	expectedLogPath := fmt.Sprintf(rootDir+"/containers/%s/json.log", containerID)
 	c.Assert(strings.TrimSpace(output), check.Equals, expectedLogPath)
+
+	output = command.PouchRun("inspect", "-f", "{{.ResolvConfPath}}", name).Stdout()
+	expectedLogPath = fmt.Sprintf(rootDir+"/containers/%s/resolv.conf", containerID)
+	c.Assert(strings.TrimSpace(output), check.Equals, expectedLogPath)
+
+	output = command.PouchRun("inspect", "-f", "{{.HostnamePath}}", name).Stdout()
+	expectedLogPath = fmt.Sprintf(rootDir+"/containers/%s/hostname", containerID)
+	c.Assert(strings.TrimSpace(output), check.Equals, expectedLogPath)
+
+	output = command.PouchRun("inspect", "-f", "{{.HostsPath}}", name).Stdout()
+	expectedLogPath = fmt.Sprintf(rootDir+"/containers/%s/hosts", containerID)
+	c.Assert(strings.TrimSpace(output), check.Equals, expectedLogPath)
+
+	output = command.PouchRun("inspect", "-f", "{{.HostConfig.Privileged}}", name).Stdout()
+	c.Assert(strings.TrimSpace(output), check.Equals, "false")
 }
 
 // TestInspectWrongFormat is to verify using wrong format flag of inspect command.
@@ -181,7 +195,7 @@ func (suite *PouchInspectSuite) TestContainerInspectState(c *check.C) {
 	defer DelContainerForceMultyTime(c, name)
 	res.Assert(c, icmd.Success)
 	// stop container
-	res = command.PouchRun("stop", "-t", "0", name)
+	res = command.PouchRun("stop", "-t", "1", name)
 	res.Assert(c, icmd.Success)
 
 	output = command.PouchRun("inspect", "-f", "{{.State.Pid}}", name).Stdout()
@@ -205,5 +219,59 @@ func (suite *PouchInspectSuite) TestContainerInspectPorts(c *check.C) {
 		c.Fatal("fail to format container json")
 	}
 	data, _ := json.Marshal(containers[0].NetworkSettings.Ports)
-	c.Assert(string(data), check.Equals, "{\"80/tcp\":[{\"HostPort\":\"8080\"}]}")
+	c.Assert(string(data), check.Equals, "{\"80/tcp\":[{\"HostIp\":\"0.0.0.0\",\"HostPort\":\"8080\"}]}")
+}
+
+func (suite *PouchInspectSuite) TestContainerInspectHostRootPath(c *check.C) {
+	name := "TestContainerInspectHostRootPath"
+	res := command.PouchRun("run", "-d", "--name", name, busyboxImage, "top")
+	defer DelContainerForceMultyTime(c, name)
+	res.Assert(c, icmd.Success)
+
+	hostRootPathOutput := command.PouchRun("inspect", "-f", "{{.HostRootPath}}", name).Stdout()
+	containerOutput := command.PouchRun("inspect", name).Stdout()
+
+	containers := make([]types.ContainerJSON, 1)
+	err := json.Unmarshal([]byte(containerOutput), &containers)
+	if err != nil || len(containers) == 0 {
+		c.Fatal("fail to format container json")
+	}
+
+	if containers[0].GraphDriver == nil {
+		c.Fatal("cannot to find any info of GraphDriver")
+	}
+
+	c.Assert(strings.TrimSpace(hostRootPathOutput), check.Equals, containers[0].GraphDriver.Data["MergedDir"])
+}
+
+// TestContainerInspectExecIds is to valid if we can normally inspect ExecIds
+func (suite *PouchInspectSuite) TestContainerInspectExecIds(c *check.C) {
+	name := "TestContainerInspectExecIds"
+	command.PouchRun("run", "-d",
+		"--name", name,
+		busyboxImage, "top",
+	).Assert(c, icmd.Success)
+	defer DelContainerForceMultyTime(c, name)
+
+	// first check `ExecIds` when the container created
+	output := command.PouchRun("inspect", "-f", "{{.ExecIds}}", name).Stdout()
+	c.Assert(string(output), check.Equals, "[]\n")
+
+	// then check `ExecIds` when execute a exec command
+	command.PouchRun("exec", name, "echo", "hi").Assert(c, icmd.Success)
+	output = command.PouchRun("inspect", name).Stdout()
+	containers := make([]types.ContainerJSON, 1)
+	err := json.Unmarshal([]byte(output), &containers)
+	if err != nil || len(containers) != 1 {
+		c.Fatal("fail to format container json")
+	}
+
+	execIDs := containers[0].ExecIds
+	if len(execIDs) != 1 {
+		c.Errorf("expected one exec id, but got: %v", execIDs)
+	}
+
+	output = command.PouchRun("inspect", "-f", "{{.ExecIds}}", name).Stdout()
+	expected := fmt.Sprintf("[%v]\n", execIDs[0])
+	c.Assert(string(output), check.Equals, expected)
 }

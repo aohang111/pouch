@@ -2,11 +2,12 @@ package main
 
 import (
 	"os"
-	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/alibaba/pouch/test/command"
 	"github.com/alibaba/pouch/test/environment"
+	"github.com/alibaba/pouch/test/util"
 
 	"github.com/go-check/check"
 	"github.com/gotestyourself/gotestyourself/icmd"
@@ -51,32 +52,42 @@ func testRunWithCgroupParent(c *check.C, cgroupParent, name string) {
 	defer DelContainerForceMultyTime(c, name)
 	res.Assert(c, icmd.Success)
 
-	containerID, err := inspectFilter(name, ".ID")
-	c.Assert(err, check.IsNil)
+	res = command.PouchRun("exec", name, "cat", "/sys/fs/cgroup/memory/memory.limit_in_bytes")
+	res.Assert(c, icmd.Success)
+	c.Assert(util.PartialEqual(res.Stdout(), "314572800"), check.IsNil)
 
-	// this code slice may not robust, but for this test case is enough.
-	cgroupParent = strings.TrimPrefix(cgroupParent, "/")
+	res = command.PouchRun("exec", name, "cat", "/proc/self/cgroup")
+	res.Assert(c, icmd.Success)
+	cgroupPaths := util.ParseCgroupFile(res.Stdout())
 
-	if cgroupParent == "" {
-		cgroupParent = "default"
+	for _, v := range cgroupPaths {
+		// NOTE: if container in child cgroup namespace, cgroup mount is /,
+		// skip test since we can not get total cgroup path
+		if v == "/" {
+			break
+		}
+		if !strings.Contains(v, cgroupParent) {
+			c.Fatalf("unexpected cgroup path %v, expect to has %s in path", v, cgroupParent)
+		}
 	}
 
-	file := "/sys/fs/cgroup/memory/" + cgroupParent + "/" +
-		containerID + "/memory.limit_in_bytes"
-	if _, err := os.Stat(file); err != nil {
-		c.Fatalf("container %s cgroup mountpoint not exists", name)
-	}
+	// inspect Container ID
+	res = command.PouchRun("inspect", "-f", "{{.ID}}", name)
+	res.Assert(c, icmd.Success)
+	containerID := strings.TrimSpace(res.Stdout())
 
-	out, err := exec.Command("cat", file).Output()
-	if err != nil {
-		c.Fatalf("execute cat command failed: %v", err)
+	// if cgroupParent is absolute path, cgroup path should /cgroupMount/subsystem/
+	if filepath.IsAbs(cgroupParent) {
+		for p := range cgroupPaths {
+			// like name=systemd, and rdma not created by runc
+			if strings.Contains(p, "=") || strings.Contains(p, "rdma") {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join("/sys/fs/cgroup", p, cgroupParent, containerID)); err != nil {
+				c.Fatalf("%s cgroup path should exist", filepath.Join("/sys/fs/cgroup", p, cgroupParent, containerID))
+			}
+		}
 	}
-
-	if !strings.Contains(string(out), "314572800") {
-		c.Fatalf("unexpected output %s expected %s\n",
-			string(out), "314572800")
-	}
-
 }
 
 // TestRunInvalidCgroupParent checks that a specially-crafted cgroup parent

@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -33,6 +34,10 @@ const (
 	// stopTimeout used to send SIGTERM to containerd in limit time to shutdown containerd
 	// if the containerd is still alive, Stop action will send SIGKILL
 	stopTimeout = 15 * time.Second
+
+	// delayRetryTimeout is used to hold for a while if the restart
+	// containerd fails
+	delayRetryTimeout = 500 * time.Millisecond
 )
 
 // Opt is used to modify the daemon setting.
@@ -47,6 +52,8 @@ type Daemon struct {
 	rootDir    string
 	stateDir   string
 	logger     *logrus.Entry
+	waitCh     chan struct{}
+	stopCh     chan struct{}
 }
 
 // Address returns containerd grpc address.
@@ -73,6 +80,7 @@ func Start(ctx context.Context, rootDir, stateDir string, opts ...Opt) (*Daemon,
 		rootDir:    rootDir,
 		stateDir:   stateDir,
 		logger:     logrus.WithField("module", "ctrd-supervisord"),
+		stopCh:     make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -95,11 +103,17 @@ func Start(ctx context.Context, rootDir, stateDir string, opts ...Opt) (*Daemon,
 	if err := d.healthPostCheck(); err != nil {
 		return nil, err
 	}
+	d.logger.WithField("containerd-pid", d.pid).Infof("success to start containerd")
+
+	go d.monitor()
 	return d, nil
 }
 
 // Stop stops the containerd in 15 seconds.
 func (d *Daemon) Stop() error {
+	// stop the monitor
+	close(d.stopCh)
+
 	if d.pid != -1 {
 		syscall.Kill(d.pid, syscall.SIGTERM)
 
@@ -156,15 +170,40 @@ func (d *Daemon) healthPostCheck() error {
 		}
 
 		client.Close()
-		d.logger.WithField("containerd-pid", d.pid).Infof("success to start containerd")
 		return nil
 	}
 
-	if utils.IsProcessAlive(d.pid) {
+	if ok, err := d.isContainerdProcess(d.pid); err != nil {
+		d.logger.Warnf("failed to get containerd process status by pid %v: %v", d.pid, err)
+	} else if ok {
 		d.logger.WithField("pid", d.pid).Warnf("try to shutdown containerd because failed to connect containerd")
 		utils.KillProcess(d.pid)
 	}
 	return fmt.Errorf("health post check failed")
+}
+
+func (d *Daemon) isContainerdProcess(pid int) (bool, error) {
+	if !utils.IsProcessAlive(pid) {
+		return false, nil
+	}
+
+	// get process path by pid, if readlink -f command exit code not equals 0,
+	// we can confirm the pid is not owned by containerd.
+	output, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+	if err != nil {
+		logrus.WithField("module", "ctrd").WithField("containerd-pid", pid).Infof("got err: %v", err)
+		return false, nil
+	}
+	processPath := strings.TrimSpace(string(output))
+
+	// get containerd process path
+	output, err = exec.LookPath(d.binaryName)
+	if err != nil {
+		return false, err
+	}
+	containerdPath := strings.TrimSpace(string(output))
+
+	return processPath == containerdPath, nil
 }
 
 func (d *Daemon) runContainerd() error {
@@ -178,6 +217,10 @@ func (d *Daemon) runContainerd() error {
 	// 2. how to make sure the address is the same one?
 	if pid != -1 {
 		logrus.WithField("module", "ctrd").WithField("containerd-pid", pid).Infof("containerd is still running")
+		if err := d.setContainerdPid(pid); err != nil {
+			utils.KillProcess(d.pid)
+			return fmt.Errorf("failed to save the pid into %s: %v", d.pidPath(), err)
+		}
 		return nil
 	}
 
@@ -210,20 +253,103 @@ func (d *Daemon) runContainerd() error {
 		}
 	}
 
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-
-	// reap the containerd process when it has been killed
+	d.waitCh = make(chan struct{})
+	// run and wait the containerd process
+	pidChan := make(chan int)
 	go func() {
-		cmd.Wait()
+		runtime.LockOSThread()
+		defer close(d.waitCh)
+
+		if err := cmd.Start(); err != nil {
+			logrus.Errorf("containerd failed to start: %v", err)
+			pidChan <- -1
+			return
+		}
+		pidChan <- cmd.Process.Pid
+		if err := cmd.Wait(); err != nil {
+			logrus.Errorf("containerd exits: %v", err)
+		}
 	}()
 
-	if err := d.setContainerdPid(cmd.Process.Pid); err != nil {
+	pid = <-pidChan
+	if pid == -1 {
+		return fmt.Errorf("containerd failed to start")
+	}
+	if err := d.setContainerdPid(pid); err != nil {
 		utils.KillProcess(d.pid)
 		return fmt.Errorf("failed to save the pid into %s: %v", d.pidPath(), err)
 	}
 	return nil
+}
+
+// monitor will try to restart containerd if containerd has been killed or
+// panic.
+//
+// NOTE: if retry time is too much and restart still fails, the monitor
+// will exit the whole process.
+func (d *Daemon) monitor() {
+	var (
+		maxRetryCount = 10
+		count         = 0
+	)
+
+	for {
+		select {
+		case <-d.stopCh:
+			d.logger.Info("receiving stop containerd action and stop monitor")
+			return
+		default:
+		}
+
+		if count > maxRetryCount {
+			d.logger.Warnf("failed to restart containerd in time and exit whole process")
+			os.Exit(1)
+		}
+
+		pid, err := d.getContainerdPid()
+		if err != nil {
+			d.logger.Warnf("failed to get containerd pid and will retry it again: %v", err)
+			count++
+			continue
+		}
+
+		if pid == -1 {
+			if d.waitCh != nil {
+				select {
+				case <-d.waitCh:
+					select {
+					case <-d.stopCh:
+						d.logger.Info("receiving stop containerd action and stop monitor")
+						return
+					default:
+					}
+				case <-d.stopCh:
+					d.logger.Info("receiving stop containerd action and stop monitor")
+					return
+				}
+			}
+
+			count++
+			if err := d.runContainerd(); err != nil {
+				d.logger.Warnf("failed to restart containerd and will retry it again: %v", err)
+				time.Sleep(delayRetryTimeout)
+				continue
+			}
+		}
+
+		if err := d.healthPostCheck(); err != nil {
+			d.logger.Warn("failed to do health check and will retry it again")
+			count++
+			time.Sleep(delayRetryTimeout)
+			continue
+		}
+
+		if count != 0 {
+			count = 0
+			d.logger.WithField("containerd-pid", d.pid).Infof("success to start containerd")
+		}
+		time.Sleep(delayRetryTimeout)
+	}
 }
 
 func (d *Daemon) setContainerdPid(pid int) error {
@@ -253,10 +379,18 @@ func (d *Daemon) getContainerdPid() (int, error) {
 			return -1, err
 		}
 
-		if utils.IsProcessAlive(int(pid)) {
+		isAlive, err := d.isContainerdProcess(int(pid))
+		if err != nil {
+			return -1, err
+		} else if !isAlive {
+			logrus.WithField("module", "ctrd").WithField("ctrd-supervisord", pid).Infof("previous containerd pid not exist, delete the pid file")
+			os.RemoveAll(d.pidPath())
+			return -1, nil
+		} else {
 			return int(pid), nil
 		}
 	}
+
 	return -1, nil
 }
 

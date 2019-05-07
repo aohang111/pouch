@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -29,7 +28,6 @@ import (
 	mountutils "github.com/alibaba/pouch/pkg/mount"
 	"github.com/alibaba/pouch/pkg/streams"
 	"github.com/alibaba/pouch/pkg/utils"
-	"github.com/alibaba/pouch/storage/quota"
 	volumetypes "github.com/alibaba/pouch/storage/volume/types"
 
 	"github.com/containerd/cgroups"
@@ -221,7 +219,7 @@ func NewContainerManager(ctx context.Context, store *meta.Store, cli ctrd.APICli
 
 	mgr.Client.SetExitHooks(mgr.exitedAndRelease)
 	mgr.Client.SetExecExitHooks(mgr.execExitedAndRelease)
-	mgr.Client.SetEventsHooks(mgr.publishContainerdEvent)
+	mgr.Client.SetEventsHooks(mgr.publishContainerdEvent, mgr.updateContainerState)
 
 	go mgr.execProcessGC()
 
@@ -256,19 +254,19 @@ func (mgr *ContainerManager) Restore(ctx context.Context) error {
 	containers, err := mgr.List(ctx,
 		&ContainerListOption{
 			All: true,
-			FilterFunc: func(c *Container) bool {
-				return (c.IsRunning() || c.IsPaused())
-			}})
+		},
+	)
 	if err != nil {
-		logrus.Errorf("failed to get container list when restore alive containers: %v", err)
+		logrus.Errorf("failed to get container list when restore containers: %v", err)
 		return errors.Wrap(err, "failed to get container list")
 	}
 
-	// start recover all alive containers
 	for _, c := range containers {
-		logrus.Debugf("Start recover container %s", c.Key())
 		id := c.Key()
-		// recover the running or paused container.
+
+		// NOTE: when pouch is restarting, we need to initialize
+		// container IO for the existing containers just in case that
+		// user tries to restart the stopped containers.
 		cntrio, err := mgr.initContainerIO(c)
 		if err != nil {
 			logrus.Errorf("failed to init container IO %s: %v", id, err)
@@ -279,6 +277,13 @@ func (mgr *ContainerManager) Restore(ctx context.Context) error {
 			logrus.Errorf("failed to init log driver %s: %v", id, err)
 			return err
 		}
+
+		// recover the running or paused container.
+		if !c.IsRunningOrPaused() {
+			continue
+		}
+
+		logrus.Debugf("Start recover container %s", id)
 
 		// Start recover the container
 		err = mgr.Client.RecoverContainer(ctx, id, cntrio)
@@ -311,12 +316,25 @@ func (mgr *ContainerManager) Restore(ctx context.Context) error {
 
 // Create checks passed in parameters and create a Container object whose status is set at Created.
 func (mgr *ContainerManager) Create(ctx context.Context, name string, config *types.ContainerCreateConfig) (resp *types.ContainerCreateResp, err error) {
+	currentSnapshotter := ctrd.CurrentSnapshotterName(ctx)
+	config.Snapshotter = currentSnapshotter
+
 	if mgr.containerPlugin != nil {
 		logrus.Infof("invoke container pre-create hook in plugin")
 		if ex := mgr.containerPlugin.PreCreate(config); ex != nil {
 			return nil, errors.Wrapf(ex, "pre-create plugin point execute failed")
 		}
 	}
+
+	// Attention, since we support multi snapshotter, if snapshotter not changed,
+	// means plugin not change it, so remove value in case to effect origin logic
+	if config.Snapshotter == currentSnapshotter {
+		config.Snapshotter = ""
+	}
+
+	// NOTE: choose snapshotter, snapshotter can only be set
+	// through containerPlugin in Create function
+	ctx = ctrd.WithSnapshotter(ctx, config.Snapshotter)
 
 	// cleanup allocated resources when failed
 	cleanups := []func() error{}
@@ -345,6 +363,11 @@ func (mgr *ContainerManager) Create(ctx context.Context, name string, config *ty
 	}
 	if config.NetworkingConfig == nil {
 		return nil, errors.Wrapf(errtypes.ErrInvalidParam, "NetworkingConfig cannot be empty")
+	}
+
+	// validate disk quota
+	if err := mgr.validateDiskQuota(config); err != nil {
+		return nil, errors.Wrapf(err, "invalid disk quota config")
 	}
 
 	id, err := mgr.generateContainerID(config.SpecificID)
@@ -405,6 +428,12 @@ func (mgr *ContainerManager) Create(ctx context.Context, name string, config *ty
 	// set default log driver and validate for logger driver
 	config.HostConfig.LogConfig = mgr.getDefaultLogConfigIfMissing(config.HostConfig.LogConfig)
 
+	// set ReadonlyPaths and MaskedPaths to nil if privileged was set.
+	if config.HostConfig.Privileged {
+		config.HostConfig.ReadonlyPaths = nil
+		config.HostConfig.MaskedPaths = nil
+	}
+
 	container := &Container{
 		State: &types.ContainerState{
 			Status:     types.StatusCreated,
@@ -450,7 +479,8 @@ func (mgr *ContainerManager) Create(ctx context.Context, name string, config *ty
 	if len(config.NetworkingConfig.EndpointsConfig) > 0 {
 		container.NetworkSettings.Networks = config.NetworkingConfig.EndpointsConfig
 	}
-	if container.NetworkSettings.Networks == nil && !IsContainer(config.HostConfig.NetworkMode) {
+	if container.NetworkSettings.Networks == nil &&
+		!IsContainer(config.HostConfig.NetworkMode) && !IsNetNS(config.HostConfig.NetworkMode) {
 		container.NetworkSettings.Networks = make(map[string]*types.EndpointSettings)
 		container.NetworkSettings.Networks[config.HostConfig.NetworkMode] = new(types.EndpointSettings)
 	}
@@ -527,6 +557,24 @@ func (mgr *ContainerManager) Get(ctx context.Context, name string) (*Container, 
 	if err != nil {
 		return nil, err
 	}
+	cID := c.ID
+
+	// get all execids belongs to this container
+	fn := func(v interface{}) bool {
+		execConfig, ok := v.(*ContainerExecConfig)
+		if !ok || execConfig.ContainerID != cID {
+			return false
+		}
+
+		return true
+	}
+
+	var execIDs []string
+	execProcesses := mgr.ExecProcesses.Values(fn)
+	for k := range execProcesses {
+		execIDs = append(execIDs, k)
+	}
+	c.ExecIds = execIDs
 
 	return c, nil
 }
@@ -542,10 +590,9 @@ func (mgr *ContainerManager) Start(ctx context.Context, id string, options *type
 		return err
 	}
 
-	// check if container's status is running
-	if c.IsRunning() {
-		return errors.Wrapf(errtypes.ErrNotModified, "container already started")
-	}
+	// NOTE: choose snapshotter, snapshotter can only be set
+	// through containerPlugin in Create function
+	ctx = ctrd.WithSnapshotter(ctx, c.Config.Snapshotter)
 
 	err = mgr.start(ctx, c, options)
 	if err == nil {
@@ -556,8 +603,26 @@ func (mgr *ContainerManager) Start(ctx context.Context, id string, options *type
 }
 
 func (mgr *ContainerManager) start(ctx context.Context, c *Container, options *types.ContainerStartOptions) error {
+	// NOTE: add a big lock when start a container
+	c.Lock()
+	defer c.Unlock()
+
 	var err error
 	c.DetachKeys = options.DetachKeys
+
+	// check if container's status is paused
+	if c.State.Paused {
+		return fmt.Errorf("cannot start a paused container, try unpause instead")
+	}
+
+	// check if container's status is running
+	if c.State.Running {
+		return errors.Wrapf(errtypes.ErrNotModified, "container already started")
+	}
+
+	if c.State.Dead {
+		return fmt.Errorf("cannot start a dead container %s", c.ID)
+	}
 
 	attachedVolumes := map[string]struct{}{}
 	defer func() {
@@ -601,9 +666,6 @@ func (mgr *ContainerManager) start(ctx context.Context, c *Container, options *t
 }
 
 func (mgr *ContainerManager) prepareContainerNetwork(ctx context.Context, c *Container) error {
-	c.Lock()
-	defer c.Unlock()
-
 	networkMode := c.HostConfig.NetworkMode
 
 	if IsContainer(networkMode) {
@@ -619,6 +681,11 @@ func (mgr *ContainerManager) prepareContainerNetwork(ctx context.Context, c *Con
 		c.Config.Hostname = origContainer.Config.Hostname
 		c.Config.Domainname = origContainer.Config.Domainname
 
+		return nil
+	}
+
+	// network is prepared by upper system. do nothing here.
+	if IsNetNS(networkMode) {
 		return nil
 	}
 
@@ -650,6 +717,15 @@ func (mgr *ContainerManager) prepareContainerNetwork(ctx context.Context, c *Con
 		}
 	}
 
+	sb, err := mgr.NetworkMgr.Controller().SandboxByID(c.NetworkSettings.SandboxID)
+	if err != nil {
+		// sandbox not found, maybe caused by disconnect network or no endpoint
+		logrus.Warnf("failed to get sandbox by id(%s), err(%v)", c.NetworkSettings.SandboxID, err)
+		c.NetworkSettings.Ports = types.PortMap{}
+		return nil
+	}
+
+	c.NetworkSettings.Ports = getSandboxPortMapInfo(sb)
 	return nil
 }
 
@@ -671,11 +747,9 @@ func (mgr *ContainerManager) buildNetworkRelatedPath(c *Container) error {
 func (mgr *ContainerManager) createContainerdContainer(ctx context.Context, c *Container, checkpointDir, checkpointID string) error {
 	// CgroupParent from HostConfig will be first priority to use,
 	// then will be value from mgr.Config.CgroupParent
-	c.Lock()
 	if c.HostConfig.CgroupParent == "" {
 		c.HostConfig.CgroupParent = mgr.Config.CgroupParent
 	}
-	c.Unlock()
 
 	var (
 		err     error
@@ -700,11 +774,12 @@ func (mgr *ContainerManager) createContainerdContainer(ctx context.Context, c *C
 	}
 
 	sw := &SpecWrapper{
-		ctrMgr:  mgr,
-		volMgr:  mgr.VolumeMgr,
-		netMgr:  mgr.NetworkMgr,
-		prioArr: prioArr,
-		argsArr: argsArr,
+		ctrMgr:     mgr,
+		volMgr:     mgr.VolumeMgr,
+		netMgr:     mgr.NetworkMgr,
+		prioArr:    prioArr,
+		argsArr:    argsArr,
+		useSystemd: mgr.Config.UseSystemd(),
 	}
 
 	if err = createSpec(ctx, c, sw); err != nil {
@@ -724,7 +799,6 @@ func (mgr *ContainerManager) createContainerdContainer(ctx context.Context, c *C
 		return err
 	}
 
-	c.Lock()
 	ctrdContainer := &ctrd.Container{
 		ID:             c.ID,
 		Image:          c.Config.Image,
@@ -734,9 +808,10 @@ func (mgr *ContainerManager) createContainerdContainer(ctx context.Context, c *C
 		IO:             mgr.IOs.Get(c.ID),
 		RootFSProvided: c.RootFSProvided,
 		BaseFS:         c.BaseFS,
-		SnapshotID:     c.SnapshotID,
+		UseSystemd:     mgr.Config.UseSystemd(),
 	}
-	c.Unlock()
+	// make sure the SnapshotID got a proper value
+	ctrdContainer.SnapshotID = c.SnapshotKey()
 
 	if checkpointID != "" {
 		checkpointDir, err = mgr.getCheckpointDir(c.ID, checkpointDir, checkpointID, false)
@@ -763,9 +838,7 @@ func (mgr *ContainerManager) createContainerdContainer(ctx context.Context, c *C
 	c.SetStatusRunning(int64(pid))
 
 	// set Snapshot MergedDir
-	c.Lock()
 	c.Snapshotter.Data["MergedDir"] = c.BaseFS
-	c.Unlock()
 
 	return c.Write(mgr.Store)
 }
@@ -824,14 +897,9 @@ func (mgr *ContainerManager) Stop(ctx context.Context, name string, timeout int6
 		return err
 	}
 
-	if !c.IsRunningOrPaused() {
-		// stopping a non-running container is valid.
-		return nil
-	}
-
-	if timeout == 0 {
-		timeout = c.StopTimeout()
-	}
+	// NOTE: choose snapshotter, snapshotter can only be set
+	// through containerPlugin in Create function
+	ctx = ctrd.WithSnapshotter(ctx, c.Config.Snapshotter)
 
 	err = mgr.stop(ctx, c, timeout)
 	if err != nil {
@@ -843,6 +911,18 @@ func (mgr *ContainerManager) Stop(ctx context.Context, name string, timeout int6
 }
 
 func (mgr *ContainerManager) stop(ctx context.Context, c *Container, timeout int64) error {
+	c.Lock()
+	defer c.Unlock()
+
+	if !c.IsRunningOrPaused() {
+		// stopping a non-running container is valid.
+		return nil
+	}
+
+	if timeout == 0 {
+		timeout = c.StopTimeout()
+	}
+
 	id := c.ID
 	msg, err := mgr.Client.DestroyContainer(ctx, id, timeout)
 	if err != nil {
@@ -859,9 +939,9 @@ func (mgr *ContainerManager) Restart(ctx context.Context, name string, timeout i
 		return err
 	}
 
-	if timeout == 0 {
-		timeout = c.StopTimeout()
-	}
+	// NOTE: choose snapshotter, snapshotter can only be set
+	// through containerPlugin in Create function
+	ctx = ctrd.WithSnapshotter(ctx, c.Config.Snapshotter)
 
 	if c.IsRunningOrPaused() {
 		// stop container if it is running or paused.
@@ -874,16 +954,14 @@ func (mgr *ContainerManager) Restart(ctx context.Context, name string, timeout i
 
 	logrus.Debugf("start container %s when restarting", c.ID)
 
-	//let restartCount++
-	restartCount := c.RestartCount + 1
-
 	// start container
 	err = mgr.start(ctx, c, &types.ContainerStartOptions{})
 	if err != nil {
 		return err
 	}
 
-	c.RestartCount = restartCount
+	// count start times
+	c.RestartCount++
 
 	logrus.Debugf("container %s restartCount is %d", c.ID, c.RestartCount)
 	return c.Write(mgr.Store)
@@ -896,7 +974,10 @@ func (mgr *ContainerManager) Pause(ctx context.Context, name string) error {
 		return err
 	}
 
-	if !c.IsRunning() {
+	c.Lock()
+	defer c.Unlock()
+
+	if !c.State.Running {
 		return fmt.Errorf("container's status is not running: %s", c.State.Status)
 	}
 
@@ -922,7 +1003,10 @@ func (mgr *ContainerManager) Unpause(ctx context.Context, name string) error {
 		return err
 	}
 
-	if !c.IsPaused() {
+	c.Lock()
+	defer c.Unlock()
+
+	if !c.State.Paused {
 		return fmt.Errorf("status(%s) of container %s is not paused", c.State.Status, c.ID)
 	}
 
@@ -973,6 +1057,9 @@ func (mgr *ContainerManager) AttachContainerIO(ctx context.Context, name string,
 
 // AttachCRILog adds cri log to a container.
 func (mgr *ContainerManager) AttachCRILog(ctx context.Context, name string, logPath string) error {
+	if logPath == "" {
+		return errors.Wrap(errtypes.ErrInvalidParam, "logPath cannot be empty")
+	}
 	c, err := mgr.container(name)
 	if err != nil {
 		return err
@@ -992,14 +1079,19 @@ func (mgr *ContainerManager) Rename(ctx context.Context, oldName, newName string
 		return errors.Wrapf(err, "failed to rename container %s", oldName)
 	}
 
+	c.Lock()
+	defer c.Unlock()
+
+	if c.State.Dead {
+		return fmt.Errorf("cannot rename a dead container %s", c.ID)
+	}
+
 	attributes := map[string]string{
 		"oldName": oldName,
 	}
 
-	c.Lock()
 	name := c.Name
 	c.Name = newName
-	c.Unlock()
 
 	mgr.NameToID.Remove(name)
 	mgr.NameToID.Put(newName, c.ID)
@@ -1020,6 +1112,9 @@ func (mgr *ContainerManager) Update(ctx context.Context, name string, config *ty
 		return err
 	}
 
+	c.Lock()
+	defer c.Unlock()
+
 	warnings, err := validateResource(&config.Resources, true)
 	if err != nil {
 		return err
@@ -1033,23 +1128,23 @@ func (mgr *ContainerManager) Update(ctx context.Context, name string, config *ty
 	oldHostconfig := *c.HostConfig
 	defer func() {
 		if restore {
-			c.Lock()
 			c.Config = &oldConfig
 			c.HostConfig = &oldHostconfig
-			c.Unlock()
 		}
 	}()
 
-	if c.IsRunning() && config.Resources.KernelMemory != 0 {
+	if c.State.Running && config.Resources.KernelMemory != 0 {
 		return fmt.Errorf("failed to update container %s: can not update kernel memory to a running container, please stop it first", c.ID)
+	}
+
+	if c.State.Dead {
+		return fmt.Errorf("cannot update a dead container %s", c.ID)
 	}
 
 	// update container disk quota
 	if err := mgr.updateContainerDiskQuota(ctx, c, config.DiskQuota); err != nil {
 		return errors.Wrapf(err, "failed to update diskquota of container %s", c.ID)
 	}
-
-	c.Lock()
 
 	// init Container Labels
 	if c.Config.Labels == nil {
@@ -1060,10 +1155,7 @@ func (mgr *ContainerManager) Update(ctx context.Context, name string, config *ty
 	// but ContainerConfig.Labels is map[string]string
 	if len(config.Label) != 0 {
 		// support remove some labels
-		newLabels, err := opts.ParseLabels(config.Label)
-		if err != nil {
-			return errors.Wrapf(err, "failed to parse labels")
-		}
+		newLabels := opts.ParseLabels(config.Label)
 
 		for k, v := range newLabels {
 			if v == "" {
@@ -1073,7 +1165,6 @@ func (mgr *ContainerManager) Update(ctx context.Context, name string, config *ty
 			}
 		}
 	}
-	c.Unlock()
 
 	// update Resources of a container.
 	if err := mgr.updateContainerResources(c, config.Resources); err != nil {
@@ -1081,12 +1172,10 @@ func (mgr *ContainerManager) Update(ctx context.Context, name string, config *ty
 		return errors.Wrapf(err, "failed to update resource of container %s", c.ID)
 	}
 
-	c.Lock()
 	// TODO update restartpolicy when container is running.
 	if config.RestartPolicy != nil && config.RestartPolicy.Name != "" {
 		c.HostConfig.RestartPolicy = config.RestartPolicy
 	}
-	c.Unlock()
 
 	// Update Env
 	newEnvSlice, err := mergeEnvSlice(config.Env, c.Config.Env)
@@ -1105,6 +1194,10 @@ func (mgr *ContainerManager) Update(ctx context.Context, name string, config *ty
 		}
 	}
 
+	if len(config.SpecAnnotation) > 0 {
+		c.Config.SpecAnnotation = mergeAnnotation(config.SpecAnnotation, c.Config.SpecAnnotation)
+	}
+
 	if mgr.containerPlugin != nil && len(config.Env) > 0 {
 		if err = mgr.containerPlugin.PostUpdate(c.BaseFS, c.Config.Env); err != nil {
 			return err
@@ -1114,7 +1207,7 @@ func (mgr *ContainerManager) Update(ctx context.Context, name string, config *ty
 	// If container is not running, update container metadata struct is enough,
 	// resources will be updated when the container is started again,
 	// If container is running, we need to update configs to the real world.
-	if c.IsRunning() {
+	if c.State.Running {
 		if err := mgr.Client.UpdateResources(ctx, c.ID, c.HostConfig.Resources); err != nil {
 			restore = true
 			return fmt.Errorf("failed to update resource: %s", err)
@@ -1138,12 +1231,24 @@ func (mgr *ContainerManager) Remove(ctx context.Context, name string, options *t
 		return err
 	}
 
-	if !c.IsStopped() && !c.IsExited() && !c.IsCreated() && !options.Force {
+	// NOTE: choose snapshotter, snapshotter can only be set
+	// through containerPlugin in Create function
+	ctx = ctrd.WithSnapshotter(ctx, c.Config.Snapshotter)
+
+	c.Lock()
+	defer c.Unlock()
+
+	if c.IsRunningOrPaused() && !options.Force {
 		return fmt.Errorf("container %s is not stopped, cannot remove it without flag force", c.ID)
 	}
 
+	if c.State.Dead {
+		logrus.Warnf("container has been deleted %s", c.ID)
+		return nil
+	}
+
 	// if the container is running, force to stop it.
-	if c.IsRunning() && options.Force {
+	if c.IsRunningOrPaused() && options.Force {
 		_, err := mgr.Client.DestroyContainer(ctx, c.ID, c.StopTimeout())
 		if err != nil && !errtypes.IsNotfound(err) {
 			return errors.Wrapf(err, "failed to destroy container %s when removing", c.ID)
@@ -1165,6 +1270,14 @@ func (mgr *ContainerManager) Remove(ctx context.Context, name string, options *t
 		if err := mount.Unmount(c.BaseFS, 0); err != nil {
 			logrus.Errorf("failed to umount rootfs when remove the container %s: %v", c.ID, err)
 		}
+
+		// Note(ziren): when deleting a container whose rootfs was provided, we also should
+		// remove the upperDir and workDir of container. because the directories cost disk
+		// space and the disk space counted into the new container that using the same
+		// disk quota id.
+		if err := c.CleanRootfsSnapshotDirs(); err != nil {
+			logrus.Errorf("failed to clean rootfs: %v", err)
+		}
 	} else if err := mgr.Client.RemoveSnapshot(ctx, c.SnapshotKey()); err != nil {
 		// if the container is created by normal method, remove the
 		// snapshot when delete it.
@@ -1182,6 +1295,15 @@ func (mgr *ContainerManager) Remove(ctx context.Context, name string, options *t
 	mgr.cache.Remove(c.ID)
 	// remove the container IO
 	mgr.IOs.Remove(c.ID)
+	c.State.Dead = true
+
+	logRootDir, err := mgr.getLogRootDirFromOpt(c, false)
+	if err == nil && logRootDir != mgr.Store.Path(c.ID) {
+		rErr := os.RemoveAll(logRootDir)
+		if rErr != nil {
+			logrus.Warnf("failed to remove container %s log path %s: %v", c.ID, logRootDir, rErr)
+		}
+	}
 
 	// remove meta.json for container in local disk
 	if err := mgr.Store.Remove(c.Key()); err != nil {
@@ -1192,73 +1314,29 @@ func (mgr *ContainerManager) Remove(ctx context.Context, name string, options *t
 	return nil
 }
 
-func (mgr *ContainerManager) updateContainerDiskQuota(ctx context.Context, c *Container, diskQuota map[string]string) error {
+func (mgr *ContainerManager) updateContainerDiskQuota(ctx context.Context, c *Container, diskQuota map[string]string) (err error) {
 	if diskQuota == nil {
 		return nil
 	}
 
-	c.Lock()
+	// backup diskquota
+	origDiskQuota := c.Config.DiskQuota
+	defer func() {
+		if err != nil {
+			c.Config.DiskQuota = origDiskQuota
+		}
+	}()
+
+	if c.Config.DiskQuota == nil {
+		c.Config.DiskQuota = make(map[string]string)
+	}
 	for dir, quota := range diskQuota {
 		c.Config.DiskQuota[dir] = quota
 	}
-	c.Unlock()
 
 	// set mount point disk quota
-	if err := mgr.setMountPointDiskQuota(ctx, c); err != nil {
+	if err = mgr.setDiskQuota(ctx, c, false); err != nil {
 		return errors.Wrapf(err, "failed to set mount point disk quota")
-	}
-
-	c.Lock()
-	var qid uint32
-	if c.Config.QuotaID != "" {
-		id, err := strconv.Atoi(c.Config.QuotaID)
-		if err != nil {
-			return errors.Wrapf(err, "failed to convert QuotaID %s", c.Config.QuotaID)
-		}
-
-		qid = uint32(id)
-		if id < 0 {
-			// QuotaID is < 0, it means pouchd alloc a unique quota id.
-			qid, err = quota.GetNextQuotaID()
-			if err != nil {
-				return errors.Wrap(err, "failed to get next quota id")
-			}
-
-			// update QuotaID
-			c.Config.QuotaID = strconv.Itoa(int(qid))
-		}
-	}
-	c.Unlock()
-
-	// get rootfs quota
-	defaultQuota := quota.GetDefaultQuota(c.Config.DiskQuota)
-	if qid > 0 && defaultQuota == "" {
-		return fmt.Errorf("set quota id but have no set default quota size")
-	}
-	// update container rootfs disk quota
-	// TODO: add lock for container?
-	rootfs := ""
-	if c.IsRunningOrPaused() && c.Snapshotter != nil {
-		basefs, ok := c.Snapshotter.Data["MergedDir"]
-		if !ok || basefs == "" {
-			return fmt.Errorf("Container is running, but MergedDir is missing")
-		}
-		rootfs = basefs
-	} else {
-		if err := mgr.Mount(ctx, c); err != nil {
-			return errors.Wrapf(err, "failed to mount rootfs: (%s)", c.MountFS)
-		}
-		rootfs = c.MountFS
-
-		defer func() {
-			if err := mgr.Unmount(ctx, c); err != nil {
-				logrus.Errorf("failed to umount rootfs: (%s), err: (%v)", c.MountFS, err)
-			}
-		}()
-	}
-	_, err := quota.SetRootfsDiskQuota(rootfs, defaultQuota, qid)
-	if err != nil {
-		return errors.Wrapf(err, "failed to set container rootfs diskquota")
 	}
 
 	return nil
@@ -1266,17 +1344,27 @@ func (mgr *ContainerManager) updateContainerDiskQuota(ctx context.Context, c *Co
 
 // updateContainerResources update container's resources parameters.
 func (mgr *ContainerManager) updateContainerResources(c *Container, resources types.Resources) error {
-	c.Lock()
-	defer c.Unlock()
 	// update resources of container.
 	cResources := &c.HostConfig.Resources
 	if resources.BlkioWeight != 0 {
 		cResources.BlkioWeight = resources.BlkioWeight
 	}
+	if len(resources.BlkioDeviceReadBps) != 0 {
+		cResources.BlkioDeviceReadBps = resources.BlkioDeviceReadBps
+	}
+	if len(resources.BlkioDeviceReadIOps) != 0 {
+		cResources.BlkioDeviceReadIOps = resources.BlkioDeviceReadIOps
+	}
+	if len(resources.BlkioDeviceWriteBps) != 0 {
+		cResources.BlkioDeviceWriteBps = resources.BlkioDeviceWriteBps
+	}
+	if len(resources.BlkioDeviceWriteIOps) != 0 {
+		cResources.BlkioDeviceWriteIOps = resources.BlkioDeviceWriteIOps
+	}
 	if resources.CPUPeriod != 0 {
 		cResources.CPUPeriod = resources.CPUPeriod
 	}
-	if resources.CPUQuota > -1 {
+	if resources.CPUQuota == -1 || resources.CPUQuota >= 1000 {
 		cResources.CPUQuota = resources.CPUQuota
 	}
 	if resources.CPUShares != 0 {
@@ -1320,8 +1408,11 @@ func (mgr *ContainerManager) Top(ctx context.Context, name string, psArgs string
 		return nil, err
 	}
 
-	if !c.IsRunning() {
-		return nil, fmt.Errorf("container %s is not running, cannot execute top command", c.ID)
+	c.Lock()
+	defer c.Unlock()
+
+	if !c.IsRunningOrPaused() {
+		return nil, fmt.Errorf("container %s is not running or paused, cannot execute top command", c.ID)
 	}
 
 	pids, err := mgr.Client.ContainerPIDs(ctx, c.ID)
@@ -1349,6 +1440,9 @@ func (mgr *ContainerManager) Resize(ctx context.Context, name string, opts types
 		return err
 	}
 
+	c.Lock()
+	defer c.Unlock()
+
 	if !c.IsRunningOrPaused() {
 		return fmt.Errorf("failed to resize container %s: container is not running", c.ID)
 	}
@@ -1366,16 +1460,10 @@ func (mgr *ContainerManager) Wait(ctx context.Context, name string) (types.Conta
 	// We should notice that container's meta data shouldn't be locked in wait process, otherwise waiting for
 	// a running container to stop would make other client commands which manage this container are blocked.
 	// If a container status is exited or stopped, return exit code immediately.
-	if c.IsExited() || c.IsStopped() {
+	if !c.IsRunningOrPaused() {
 		return types.ContainerWaitOKBody{
 			Error:      c.State.Error,
 			StatusCode: c.ExitCode(),
-		}, nil
-	}
-	// If a container status is created, return 0 as status code.
-	if c.IsCreated() {
-		return types.ContainerWaitOKBody{
-			StatusCode: 0,
 		}, nil
 	}
 
@@ -1401,8 +1489,11 @@ func (mgr *ContainerManager) Connect(ctx context.Context, name string, networkID
 		epConfig = &types.EndpointSettings{}
 	}
 
-	if !c.IsRunning() {
-		if c.IsDead() {
+	c.Lock()
+	defer c.Unlock()
+
+	if !c.State.Running {
+		if c.State.Dead {
 			return fmt.Errorf("container %s is marked for removal and cannot be connected or disconnected to the network %s", c.ID, n.Name)
 		}
 
@@ -1433,35 +1524,29 @@ func (mgr *ContainerManager) Disconnect(ctx context.Context, containerName, netw
 		return fmt.Errorf("failed to get network %s when disconnecting container %s: %v", networkName, c.Name, err)
 	}
 
-	// container cannot be disconnected from host network
 	c.Lock()
-	networkMode := c.HostConfig.NetworkMode
-	c.Unlock()
+	defer c.Unlock()
 
+	// container cannot be disconnected from host network
+	networkMode := c.HostConfig.NetworkMode
 	if IsHost(networkMode) && IsHost(network.Mode) {
 		return fmt.Errorf("container cannot be disconnected from host network or connected to hostnetwork ")
 	}
 
-	c.Lock()
-	networkSettings := c.NetworkSettings
-	c.Unlock()
-
-	if networkSettings == nil {
+	if c.NetworkSettings == nil {
 		return nil
 	}
 
-	epConfig, ok := networkSettings.Networks[network.Name]
+	epConfig, ok := c.NetworkSettings.Networks[network.Name]
 	if !ok {
 		// container not attached to the given network
 		return fmt.Errorf("failed to disconnect container from network: container %s not attach to %s", c.Name, networkName)
 	}
 
-	c.Lock()
 	endpoint := mgr.buildContainerEndpoint(c, network.Name)
-	c.Unlock()
 	endpoint.EndpointConfig = epConfig
 	if err := mgr.NetworkMgr.EndpointRemove(ctx, endpoint); err != nil {
-		// TODO(ziren): it is a trick, we should wrapper sanbox
+		// TODO(ziren): it is a trick, we should wrapper sandbox
 		// not found as an error type
 		if !strings.Contains(err.Error(), "not found") {
 			logrus.Errorf("failed to remove endpoint: %v", err)
@@ -1470,18 +1555,16 @@ func (mgr *ContainerManager) Disconnect(ctx context.Context, containerName, netw
 	}
 
 	// disconnect an endpoint success, delete endpoint info from container json
-	delete(networkSettings.Networks, network.Name)
+	delete(c.NetworkSettings.Networks, network.Name)
 
 	// if container has no network attached any more, set NetworkDisabled to true
 	// so that not setup Network Namespace when restart the container
-	c.Lock()
-	if len(networkSettings.Networks) == 0 {
+	if len(c.NetworkSettings.Networks) == 0 {
 		c.Config.NetworkDisabled = true
 	}
 
 	// container meta changed, refresh the cache
 	mgr.cache.Put(c.ID, c)
-	c.Unlock()
 
 	mgr.LogNetworkEventWithAttributes(ctx, network.Network, "disconnect", map[string]string{"container": c.ID})
 
@@ -1548,9 +1631,7 @@ func (mgr *ContainerManager) connectToNetwork(ctx context.Context, container *Co
 		return errors.Wrap(err, "failed to get network")
 	}
 
-	container.Lock()
 	endpoint := mgr.buildContainerEndpoint(container, network.Name)
-	container.Unlock()
 	endpoint.EndpointConfig = epConfig
 	if _, err := mgr.NetworkMgr.EndpointCreate(ctx, endpoint); err != nil {
 		logrus.Errorf("failed to create endpoint: %v", err)
@@ -1583,7 +1664,11 @@ func (mgr *ContainerManager) initLogDriverBeforeStart(c *Container) error {
 		}
 	}
 
-	logInfo := mgr.convContainerToLoggerInfo(c)
+	logInfo, err := mgr.convContainerToLoggerInfo(c)
+	if err != nil {
+		return err
+	}
+
 	logDriver, err := logOptionsForContainerio(c, logInfo)
 	if err != nil {
 		return err
@@ -1704,6 +1789,9 @@ func (mgr *ContainerManager) exitedAndRelease(id string, m *ctrd.Message, cleanu
 		return err
 	}
 
+	c.Lock()
+	defer c.Unlock()
+
 	if err := mgr.markExitedAndRelease(c, m); err != nil {
 		return err
 	}
@@ -1728,14 +1816,12 @@ func (mgr *ContainerManager) exitedAndRelease(id string, m *ctrd.Message, cleanu
 	// send exit event to monitor
 	mgr.monitor.PostEvent(ContainerExitEvent(c).WithHandle(func(c *Container) error {
 		// check status and restart policy
-		if !c.IsExited() {
+		if !c.State.Exited {
 			return nil
 		}
 
-		c.Lock()
 		policy := (*ContainerRestartPolicy)(c.HostConfig.RestartPolicy)
 		keys := c.DetachKeys
-		c.Unlock()
 
 		if policy == nil || policy.IsNone() {
 			return nil
@@ -1781,18 +1867,11 @@ func (mgr *ContainerManager) releaseContainerResources(c *Container) error {
 
 // releaseContainerNetwork release container network when container exits or is stopped.
 func (mgr *ContainerManager) releaseContainerNetwork(c *Container) error {
-	c.Lock()
-	defer c.Unlock()
-
 	// NetworkMgr is nil, which means the pouch daemon is initializing.
 	// And the libnetwork will also initialize, which will release all
 	// staled network resources(endpoint, network and namespace). So we
 	// don't need release the network resources.
-	if mgr.NetworkMgr == nil {
-		return nil
-	}
-
-	if c.NetworkSettings == nil {
+	if mgr.NetworkMgr == nil || c.NetworkSettings == nil {
 		return nil
 	}
 
@@ -1854,15 +1933,13 @@ func (mgr *ContainerManager) setBaseFS(ctx context.Context, c *Container) {
 	}
 
 	// io.containerd.runtime.v1.linux as a const used by runc
-	c.Lock()
 	c.BaseFS = filepath.Join(mgr.Config.HomeDir, "containerd/state", "io.containerd.runtime.v1.linux", mgr.Config.DefaultNamespace, c.ID, "rootfs")
-	c.Unlock()
 }
 
 // execProcessGC cleans unused exec processes config every 5 minutes.
 func (mgr *ContainerManager) execProcessGC() {
 	for range time.Tick(time.Duration(GCExecProcessTick) * time.Minute) {
-		execProcesses := mgr.ExecProcesses.Values()
+		execProcesses := mgr.ExecProcesses.Values(nil)
 		cleaned := 0
 
 		for id, v := range execProcesses {

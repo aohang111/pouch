@@ -43,6 +43,7 @@ type Daemon struct {
 	networkMgr      mgr.NetworkMgr
 	server          server.Server
 	containerPlugin hookplugins.ContainerPlugin
+	imagePlugin     hookplugins.ImagePlugin
 	daemonPlugin    hookplugins.DaemonPlugin
 	volumePlugin    hookplugins.VolumePlugin
 	criPlugin       hookplugins.CriPlugin
@@ -79,6 +80,7 @@ func NewDaemon(cfg *config.Config) *Daemon {
 
 	if cfg.Debug {
 		ctrdDaemonOpts = append(ctrdDaemonOpts, supervisord.WithLogLevel("debug"))
+		ctrdDaemonOpts = append(ctrdDaemonOpts, supervisord.WithV1RuntimeShimDebug())
 	}
 
 	ctrdDaemon, err := supervisord.Start(context.TODO(),
@@ -95,11 +97,23 @@ func NewDaemon(cfg *config.Config) *Daemon {
 	ctrdClient, err := ctrd.NewClient(
 		ctrd.WithRPCAddr(cfg.ContainerdAddr),
 		ctrd.WithDefaultNamespace(cfg.DefaultNamespace),
+		ctrd.WithInsecureRegistries(cfg.InsecureRegistries),
 	)
 	if err != nil {
 		logrus.Errorf("failed to new containerd's client: %v", err)
 		return nil
 	}
+
+	if cfg.Snapshotter != "" {
+		ctrd.SetSnapshotterName(cfg.Snapshotter)
+	}
+
+	if err = ctrdClient.CheckSnapshotterValid(ctrd.CurrentSnapshotterName(context.TODO()), cfg.AllowMultiSnapshotter); err != nil {
+		logrus.Errorf("failed to check snapshotter driver: %v", err)
+		return nil
+	}
+
+	logrus.Infof("Snapshotter is set to be %s", ctrd.CurrentSnapshotterName(context.TODO()))
 
 	return &Daemon{
 		config:         cfg,
@@ -120,6 +134,11 @@ func (d *Daemon) loadPlugin() error {
 	// load container plugin if exist
 	if containerPlugin := hookplugins.GetContainerPlugin(); containerPlugin != nil {
 		d.containerPlugin = containerPlugin
+	}
+
+	// load image plugin if exist
+	if imagePlugin := hookplugins.GetImagePlugin(); imagePlugin != nil {
+		d.imagePlugin = imagePlugin
 	}
 
 	// load volume plugin if exist
@@ -336,6 +355,11 @@ func (d *Daemon) networkInit(ctx context.Context) error {
 // ContainerPlugin returns the container plugin fetched from shared file
 func (d *Daemon) ContainerPlugin() hookplugins.ContainerPlugin {
 	return d.containerPlugin
+}
+
+// ImagePlugin returns the container plugin fetched from shared file
+func (d *Daemon) ImagePlugin() hookplugins.ImagePlugin {
+	return d.imagePlugin
 }
 
 // ShutdownPlugin invoke pre-stop method in daemon plugin if exist

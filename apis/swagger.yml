@@ -423,6 +423,33 @@ paths:
         500:
           $ref: "#/responses/500ErrorResponse"
 
+  /images/{imageid}/push:
+    post:
+      summary: "push an image"
+      description: "push an image on the registry"
+      operationId: "ImagePush"
+      consumes:
+        - "application/octet-stream"
+      produces:
+        - "application/json"
+      parameters:
+        - $ref: "#/parameters/imageid"
+        - name: "tag"
+          in: "query"
+          description: "the tag to associate with the image on the registry. This is optional."
+          type: "string"
+        - name: "X-Registry-Auth"
+          in: "header"
+          description: "A base64-encoded auth configuration. [See the authentication section for details.](#section/Authentication)"
+          type: "string"
+      responses:
+        200:
+          description: "no error"
+        404:
+          $ref: "#/responses/404ErrorResponse"
+        500:
+          $ref: "#/responses/500ErrorResponse"
+
   /containers/create:
     post:
       summary: "Create a container"
@@ -2122,7 +2149,9 @@ definitions:
         x-nullable: false
       Env:
         description: |
-          A list of environment variables to set inside the container in the form `["VAR=value", ...]`. A variable without `=` is removed from the environment, rather than to have an empty value.
+          A list of environment variables to set inside the container in the form `["VAR=value", ...]`. 
+          A variable like "A=" means setting env A in container to be empty value.
+          And a variable without `=` is removed from the environment, rather than to have an empty value.
         type: "array"
         items:
           type: "string"
@@ -2236,7 +2265,12 @@ definitions:
           MaxLength: 64
           The characters of given id should be in 0123456789abcdef.
           By default, given id is unnecessary.
- 
+      Snapshotter:
+        description: |
+            The snapshotter container choose, can be different with
+            default snapshotter. The Field only set through hook plugin.
+        type: "string"
+
   ContainerCreateResp:
     description: "response returned by daemon when container create successfully"
     type: "object"
@@ -2258,9 +2292,9 @@ definitions:
 
   HostConfig:
     description: "Container configuration that depends on the host we are running on"
-    type: "object"
     allOf:
-      - properties:
+      - type: "object"
+        properties:
           # Applicable to all platforms
           Binds:
             type: "array"
@@ -2286,7 +2320,7 @@ definitions:
             $ref: "#/definitions/RestartPolicy"
           NetworkMode:
             type: "string"
-            description: "Network mode to use for this container. Supported standard values are: `bridge`, `host`, `none`, and `container:<name|id>`. Any other value is taken as a custom network's name to which this container should connect to."
+            description: "Network mode to use for this container. Supported standard values are: `netns:<path>`, `bridge`, `host`, `none`, and `container:<name|id>`. Any other value is taken as a custom network's name to which this container should connect to."
           PortBindings:
             type: "object"
             description: "A map of exposed container ports and the host port they should map to."
@@ -2374,6 +2408,7 @@ definitions:
               - `"host"`: use the host's PID namespace inside the container
           Privileged:
             type: "boolean"
+            x-omitempty: false
             description: "Gives the container full access to the host."
           PublishAllPorts:
             type: "boolean"
@@ -2451,6 +2486,16 @@ definitions:
           InitScript:
             type: "string"
             description: "Initial script executed in container. The script will be executed before entrypoint or command"
+          MaskedPaths:
+            description: "Masks over the provided paths inside the container."
+            type: "array"
+            items:
+              type: "string"
+          ReadonlyPaths:
+            description: "Set the provided paths as RO inside the container."
+            type: "array"
+            items:
+              type: "string"
       - $ref: "#/definitions/Resources"
 
   UpdateConfig:
@@ -2462,7 +2507,9 @@ definitions:
             $ref: "#/definitions/RestartPolicy"
           Env:
             description: |
-              A list of environment variables to set inside the container in the form `["VAR=value", ...]`. A variable without `=` is removed from the environment, rather than to have an empty value.
+              A list of environment variables to set inside the container in the form `["VAR=value", ...]`.
+              A variable like "A=" means updating env A in container to be empty value.
+              A variable without `=` is removed from the environment, rather than to have an empty value.
             type: "array"
             items:
               type: "string"
@@ -2474,6 +2521,12 @@ definitions:
           DiskQuota:
             type: "object"
             description: "update disk quota for container"
+            x-nullable: true
+            additionalProperties:
+              type: "string"
+          SpecAnnotation:
+            type: "object"
+            description: "update specAnnotation for container"
             x-nullable: true
             additionalProperties:
               type: "string"
@@ -2725,37 +2778,28 @@ definitions:
         description: "ScheLatSwitch enables scheduler latency count in cpuacct"
         type: "integer"
         format: "int64"
-        minimum: 0
-        maximum: 1
         x-nullable: false
         x-omitempty: false
       MemoryWmarkRatio:
         description: | 
           MemoryWmarkRatio is an integer value representing this container's memory low water mark percentage. 
-          The value of memory low water mark is memory.limit_in_bytes * MemoryWmarkRatio. The range is in [0, 100].
+          The value of memory low water mark is memory.limit_in_bytes * MemoryWmarkRatio.
         type: "integer"
         format: "int64"
         x-nullable: true
-        minimum: 0
-        maximum: 100
         x-omitempty: false
       MemoryExtra:
         description: |
-          MemoryExtra is an integer value representing this container's memory high water mark percentage.
-          The range is in [0, 100].
+          MemoryExtra is an integer value representing memory extra in bytes
         type: "integer"
         format: "int64"
         x-nullable: true
-        minimum: 0
-        maximum: 100
         x-omitempty: false
       MemoryForceEmptyCtl:
         description: "MemoryForceEmptyCtl represents whether to reclaim the page cache when deleting cgroup."
         type: "integer"
         format: "int64"
         x-nullable: false
-        minimum: 0
-        maximum: 1
         x-omitempty: false
       NvidiaConfig:
         $ref: "#/definitions/NvidiaConfig"
@@ -3382,24 +3426,33 @@ definitions:
         description: "The container's image"
         type: "string"
       ResolvConfPath:
+        description: "the path of container's resolvConf file on host."
         type: "string"
-      HostnamePath:
+      HostnamePath: 
+        description: "the path of container's hostname file on host."
         type: "string"
       HostsPath:
+        description: "the path of container's hosts file on host."
         type: "string"
       LogPath:
+        description: "the path of container's log file on host."
         type: "string"
       Name:
+        description: "name of the created container."
         type: "string"
       RestartCount:
+        description: "the container's restart time"
         type: "integer"
       Driver:
+        description: ""
         type: "string"
       MountLabel:
+        description: "MountLabel contains the options for the 'mount' command."
         type: "string"
       ProcessLabel:
         type: "string"
       AppArmorProfile:
+        description: "AppArmorProfile are specific for AppArmor to Unix platforms"
         type: "string"
       ExecIDs:
         description: "exec ids of container"
@@ -3432,7 +3485,9 @@ definitions:
       NetworkSettings:
         description: "NetworkSettings exposes the network settings in the API."
         $ref: "#/definitions/NetworkSettings"
-
+      HostRootPath:
+        description: "The rootfs path of the container on the host."
+        type: "string"
   ContainerState:
     type: "object"
     required: [StartedAt, FinishedAt, Pid, ExitCode, Error, OOMKilled, Dead, Paused, Restarting, Running, Status]
@@ -3467,6 +3522,20 @@ definitions:
         x-nullable: false
       Dead:
         description: "Whether this container is dead."
+        type: "boolean"
+        x-nullable: false
+      Exited:
+        description: |
+          Whether this container is abnormal stopped. So that we can distinguish whether
+          a container stoppped by API or abnormal.
+
+          This flag can be used on the circumstances that when the host restart and try to pull up
+          the containers that are running before host down. If we have a container with `RestartPolicy`
+          is `always` but the `Status` is `Stopped`, should we start it or not?
+
+          So with the `Exited` flag being set, we can make sure that this container is exited by abnormal,
+          we should pull it up. But with status is `Stopped`, we should not pull it up because it is stopped
+          by API.
         type: "boolean"
         x-nullable: false
       Pid:

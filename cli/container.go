@@ -14,7 +14,7 @@ type container struct {
 	labels              []string
 	name                string
 	tty                 bool
-	volume              []string
+	volume              config.Volumes
 	volumesFrom         []string
 	runtime             string
 	env                 []string
@@ -43,6 +43,7 @@ type container struct {
 	memory           string
 	memorySwap       string
 	memorySwappiness int64
+	kernelMemory     string
 
 	memoryWmarkRatio    int64
 	memoryExtra         int64
@@ -66,6 +67,7 @@ type container struct {
 	ports          []string
 	expose         []string
 	publishAll     bool
+	macAddress     string
 	securityOpt    []string
 	capAdd         []string
 	capDrop        []string
@@ -95,10 +97,7 @@ type container struct {
 }
 
 func (c *container) config() (*types.ContainerCreateConfig, error) {
-	labels, err := opts.ParseLabels(c.labels)
-	if err != nil {
-		return nil, err
-	}
+	labels := opts.ParseLabels(c.labels)
 
 	memory, err := opts.ParseMemory(c.memory)
 	if err != nil {
@@ -106,6 +105,11 @@ func (c *container) config() (*types.ContainerCreateConfig, error) {
 	}
 
 	memorySwap, err := opts.ParseMemorySwap(c.memorySwap)
+	if err != nil {
+		return nil, err
+	}
+
+	kmemory, err := opts.ParseMemory(c.kernelMemory)
 	if err != nil {
 		return nil, err
 	}
@@ -135,6 +139,11 @@ func (c *container) config() (*types.ContainerCreateConfig, error) {
 	}
 
 	diskQuota, err := opts.ParseDiskQuota(c.diskQuota)
+	if err != nil {
+		return nil, err
+	}
+
+	quotaID, err := opts.ParseQuotaID(c.quotaID, c.diskQuota)
 	if err != nil {
 		return nil, err
 	}
@@ -196,14 +205,15 @@ func (c *container) config() (*types.ContainerCreateConfig, error) {
 			InitScript:          c.initScript,
 			ExposedPorts:        ports,
 			DiskQuota:           diskQuota,
-			QuotaID:             c.quotaID,
+			QuotaID:             quotaID,
 			SpecAnnotation:      specAnnotation,
 			NetPriority:         c.netPriority,
 			SpecificID:          c.specificID,
+			MacAddress:          c.macAddress,
 		},
 
 		HostConfig: &types.HostConfig{
-			Binds:       c.volume,
+			Binds:       c.volume.Value(),
 			VolumesFrom: c.volumesFrom,
 			Runtime:     c.runtime,
 			Resources: types.Resources{
@@ -218,6 +228,7 @@ func (c *container) config() (*types.ContainerCreateConfig, error) {
 				Memory:           memory,
 				MemorySwap:       memorySwap,
 				MemorySwappiness: &c.memorySwappiness,
+				KernelMemory:     kmemory,
 				// FIXME: validate in client side
 				MemoryWmarkRatio:    &c.memoryWmarkRatio,
 				MemoryExtra:         &c.memoryExtra,
@@ -239,23 +250,24 @@ func (c *container) config() (*types.ContainerCreateConfig, error) {
 				Ulimits:       c.ulimit.Value(),
 				PidsLimit:     c.pidsLimit,
 			},
-			DNS:           c.dns,
-			DNSOptions:    c.dnsOptions,
-			DNSSearch:     c.dnsSearch,
-			EnableLxcfs:   c.enableLxcfs,
-			Privileged:    c.privileged,
-			RestartPolicy: restartPolicy,
-			IpcMode:       c.ipcMode,
-			PidMode:       c.pidMode,
-			UTSMode:       c.utsMode,
-			GroupAdd:      c.groupAdd,
-			Sysctls:       sysctls,
-			SecurityOpt:   c.securityOpt,
-			NetworkMode:   networkMode,
-			CapAdd:        c.capAdd,
-			CapDrop:       c.capDrop,
-			PortBindings:  portBindings,
-			OomScoreAdj:   c.oomScoreAdj,
+			DNS:             c.dns,
+			DNSOptions:      c.dnsOptions,
+			DNSSearch:       c.dnsSearch,
+			EnableLxcfs:     c.enableLxcfs,
+			Privileged:      c.privileged,
+			RestartPolicy:   restartPolicy,
+			IpcMode:         c.ipcMode,
+			PidMode:         c.pidMode,
+			UTSMode:         c.utsMode,
+			GroupAdd:        c.groupAdd,
+			Sysctls:         sysctls,
+			SecurityOpt:     c.securityOpt,
+			NetworkMode:     networkMode,
+			PublishAllPorts: c.publishAll,
+			CapAdd:          c.capAdd,
+			CapDrop:         c.capDrop,
+			PortBindings:    portBindings,
+			OomScoreAdj:     c.oomScoreAdj,
 			LogConfig: &types.LogConfig{
 				LogDriver: c.logDriver,
 				LogOpts:   logOpts,

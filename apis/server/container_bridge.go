@@ -25,10 +25,14 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+const (
+	unknowHostRootPath = "<unknown>"
+)
+
 func (s *Server) createContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
 	label := util_metrics.ActionCreateLabel
-	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
 	}(time.Now())
 
@@ -84,6 +88,12 @@ func (s *Server) getContainer(ctx context.Context, rw http.ResponseWriter, req *
 		mounts = append(mounts, *mp)
 	}
 
+	hostRootPath := unknowHostRootPath
+	mergedDir, ok := c.Snapshotter.Data["MergedDir"]
+	if ok {
+		hostRootPath = mergedDir
+	}
+
 	container := types.ContainerJSON{
 		ID:           c.ID,
 		Name:         c.Name,
@@ -101,6 +111,16 @@ func (s *Server) getContainer(ctx context.Context, rw http.ResponseWriter, req *
 		},
 		Mounts:          mounts,
 		NetworkSettings: c.NetworkSettings,
+		Path:            c.Path,
+		Args:            c.Args,
+		ResolvConfPath:  c.ResolvConfPath,
+		HostnamePath:    c.HostnamePath,
+		HostRootPath:    hostRootPath,
+		HostsPath:       c.HostsPath,
+		Driver:          c.Driver,
+		MountLabel:      c.MountLabel,
+		ProcessLabel:    c.ProcessLabel,
+		ExecIds:         c.ExecIds,
 	}
 
 	return EncodeResponse(rw, http.StatusOK, container)
@@ -162,8 +182,8 @@ func (s *Server) getContainers(ctx context.Context, rw http.ResponseWriter, req 
 
 func (s *Server) startContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
 	label := util_metrics.ActionStartLabel
-	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
 	}(time.Now())
 
@@ -191,8 +211,8 @@ func (s *Server) restartContainer(ctx context.Context, rw http.ResponseWriter, r
 		err error
 	)
 	label := util_metrics.ActionRestartLabel
-	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
 	}(time.Now())
 
@@ -221,8 +241,8 @@ func (s *Server) stopContainer(ctx context.Context, rw http.ResponseWriter, req 
 	)
 
 	label := util_metrics.ActionStopLabel
-	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
 	}(time.Now())
 
@@ -268,8 +288,8 @@ func (s *Server) unpauseContainer(ctx context.Context, rw http.ResponseWriter, r
 
 func (s *Server) renameContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
 	label := util_metrics.ActionRenameLabel
-	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
 	}(time.Now())
 
@@ -327,8 +347,8 @@ func (s *Server) attachContainer(ctx context.Context, rw http.ResponseWriter, re
 
 func (s *Server) updateContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
 	label := util_metrics.ActionUpdateLabel
-	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
 	}(time.Now())
 
@@ -367,8 +387,8 @@ func (s *Server) updateContainer(ctx context.Context, rw http.ResponseWriter, re
 
 func (s *Server) upgradeContainer(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
 	label := util_metrics.ActionUpgradeLabel
-	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
 	}(time.Now())
 
@@ -473,8 +493,8 @@ func (s *Server) resizeContainer(ctx context.Context, rw http.ResponseWriter, re
 
 func (s *Server) removeContainers(ctx context.Context, rw http.ResponseWriter, req *http.Request) error {
 	label := util_metrics.ActionDeleteLabel
-	metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 	defer func(start time.Time) {
+		metrics.ContainerActionsCounter.WithLabelValues(label).Inc()
 		metrics.ContainerActionsTimer.WithLabelValues(label).Observe(time.Since(start).Seconds())
 	}(time.Now())
 

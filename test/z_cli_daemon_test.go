@@ -3,24 +3,28 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/alibaba/pouch/apis/types"
+	"github.com/alibaba/pouch/daemon/config"
 	"github.com/alibaba/pouch/test/command"
 	"github.com/alibaba/pouch/test/daemon"
+	"github.com/alibaba/pouch/test/daemonv2"
 	"github.com/alibaba/pouch/test/environment"
-
 	"github.com/alibaba/pouch/test/util"
+
 	"github.com/go-check/check"
 	"github.com/gotestyourself/gotestyourself/icmd"
 )
 
-// PouchDaemonSuite is the test suite fo daemon.
+// PouchDaemonSuite is the test suite for daemon.
 type PouchDaemonSuite struct{}
 
 func init() {
@@ -36,7 +40,7 @@ func (suite *PouchDaemonSuite) SetUpTest(c *check.C) {
 func (suite *PouchDaemonSuite) TestDaemonCgroupParent(c *check.C) {
 	dcfg, err := StartDefaultDaemonDebug("--cgroup-parent=tmp")
 	if err != nil {
-		c.Skip("deamon start failed")
+		c.Skip("daemon start failed")
 	}
 
 	// Must kill it, as we may loose the pid in next call.
@@ -209,7 +213,7 @@ func (suite *PouchDaemonSuite) TestDaemonConfigFileAndCli(c *check.C) {
 	c.Assert(err, check.IsNil)
 }
 
-// TestDaemonInvalideArgs tests invalid args in deamon return error
+// TestDaemonInvalideArgs tests invalid args in daemon return error
 func (suite *PouchDaemonSuite) TestDaemonInvalideArgs(c *check.C) {
 	_, err := StartDefaultDaemon("--config=xxx")
 	c.Assert(err, check.NotNil)
@@ -325,7 +329,7 @@ func (suite *PouchDaemonSuite) TestDaemonLabel(c *check.C) {
 	dcfg, err := StartDefaultDaemonDebug("--label", "a=b")
 	// Start a test daemon with test args.
 	if err != nil {
-		c.Skip("deamon start failed.")
+		c.Skip("daemon start failed.")
 	}
 	// Must kill it, as we may loose the pid in next call.
 	defer dcfg.KillDaemon()
@@ -340,7 +344,7 @@ func (suite *PouchDaemonSuite) TestDaemonLabelDup(c *check.C) {
 	dcfg, err := StartDefaultDaemonDebug("--label", "a=b", "--label", "a=b")
 	// Start a test daemon with test args.
 	if err != nil {
-		c.Skip("deamon start failed.")
+		c.Skip("daemon start failed.")
 	}
 	// Must kill it, as we may loose the pid in next call.
 	defer dcfg.KillDaemon()
@@ -383,7 +387,7 @@ func (suite *PouchDaemonSuite) TestDaemonCriEnabled(c *check.C) {
 	c.Assert(err, check.IsNil)
 
 	result := RunWithSpecifiedDaemon(dcfg, "info")
-	err = util.PartialEqual(result.Combined(), "CriEnabled:  true")
+	err = util.PartialEqual(result.Combined(), "CriEnabled: true")
 	c.Assert(err, check.IsNil)
 
 	defer dcfg.KillDaemon()
@@ -470,6 +474,53 @@ func (suite *PouchDaemonSuite) TestDaemonWithMultiRuntimes(c *check.C) {
 	dcfg2.KillDaemon()
 }
 
+// TestRestartStoppedContainerAfterDaemonRestart is used to test the case that
+// when container is stopped and then pouchd restarts, the restore logic should
+// initialize the existing container IO settings even though they are not alive.
+func (suite *PouchDaemonSuite) TestRestartStoppedContainerAfterDaemonRestart(c *check.C) {
+	c.Skip("The wait command can't guarantee container cleanup job can be done before api return")
+
+	cfgFile := filepath.Join("/tmp", c.TestName())
+	c.Assert(CreateConfigFile(cfgFile, nil), check.IsNil)
+	defer os.RemoveAll(cfgFile)
+
+	cfg := daemon.NewConfig()
+	cfg.NewArgs("--config-file", cfgFile)
+	c.Assert(cfg.StartDaemon(), check.IsNil)
+
+	defer cfg.KillDaemon()
+
+	var (
+		cname = c.TestName()
+		msg   = "hello"
+	)
+
+	// pull image
+	RunWithSpecifiedDaemon(&cfg, "pull", busyboxImage).Assert(c, icmd.Success)
+
+	// run a container
+	res := RunWithSpecifiedDaemon(&cfg, "run", "--name", cname, busyboxImage, "echo", msg)
+	defer ensureContainerNotExist(&cfg, cname)
+
+	res.Assert(c, icmd.Success)
+	c.Assert(strings.TrimSpace(res.Combined()), check.Equals, msg)
+
+	// wait for it.
+	RunWithSpecifiedDaemon(&cfg, "wait", cname).Assert(c, icmd.Success)
+
+	// kill the daemon and make sure it has been killed
+	cfg.KillDaemon()
+	c.Assert(cfg.IsDaemonUp(), check.Equals, false)
+
+	// restart again
+	c.Assert(cfg.StartDaemon(), check.IsNil)
+
+	// start the container again
+	res = RunWithSpecifiedDaemon(&cfg, "start", "-a", cname)
+	res.Assert(c, icmd.Success)
+	c.Assert(strings.TrimSpace(res.Combined()), check.Equals, msg)
+}
+
 // TestUpdateDaemonWithLabels tests update daemon online with labels updated
 func (suite *PouchDaemonSuite) TestUpdateDaemonWithLabels(c *check.C) {
 	cfg := daemon.NewConfig()
@@ -487,7 +538,7 @@ func (suite *PouchDaemonSuite) TestUpdateDaemonWithLabels(c *check.C) {
 	c.Assert(updated, check.Equals, true)
 }
 
-// TestUpdateDaemonWithLabels tests update daemon offline
+// TestUpdateDaemonOffline tests update daemon offline
 func (suite *PouchDaemonSuite) TestUpdateDaemonOffline(c *check.C) {
 	path := "/tmp/pouchconfig.json"
 	fd, err := os.Create(path)
@@ -600,5 +651,123 @@ func (suite *PouchDaemonSuite) TestRecoverContainerWhenHostDown(c *check.C) {
 	case <-timeout:
 		dcfg.DumpLog()
 		c.Fatalf("failed to wait container running")
+	}
+}
+
+// TestDaemonWithSysyemdCgroupDriver tests start daemon with systemd cgroup driver
+func (suite *PouchDaemonSuite) TestDaemonWithSystemdCgroupDriver(c *check.C) {
+	SkipIfFalse(c, environment.SupportSystemdCgroupDriver)
+	tmpDir, err := ioutil.TempDir("", "cgroup-driver")
+	path := filepath.Join(tmpDir, "config.json")
+	c.Assert(err, check.IsNil)
+	cfg := struct {
+		CgroupDriver string `json:"cgroup-driver,omitempty"`
+	}{
+		CgroupDriver: "systemd",
+	}
+	c.Assert(CreateConfigFile(path, cfg), check.IsNil)
+	defer os.RemoveAll(tmpDir)
+
+	dcfg, err := StartDefaultDaemon("--config-file=" + path)
+	defer dcfg.KillDaemon()
+	c.Assert(err, check.IsNil)
+
+	result := RunWithSpecifiedDaemon(dcfg, "info")
+	c.Assert(util.PartialEqual(result.Stdout(), "systemd"), check.IsNil)
+
+	cname := "TestWithSystemdCgroupDriver"
+	ret := RunWithSpecifiedDaemon(dcfg, "run", "-d", "--name", cname, busyboxImage, "top")
+	defer RunWithSpecifiedDaemon(dcfg, "rm", "-f", cname)
+	ret.Assert(c, icmd.Success)
+}
+
+// TestContainerdPIDReuse tests even though old containerd pid being reused, we can still
+// pull up the containerd instance.
+func (suite *PouchDaemonSuite) TestContainerdPIDReuse(c *check.C) {
+	cfgFile := filepath.Join("/tmp", c.TestName())
+	c.Assert(CreateConfigFile(cfgFile, nil), check.IsNil)
+	defer os.RemoveAll(cfgFile)
+
+	// prepare config file for pouchd
+	cfg := daemon.NewConfig()
+	cfg.NewArgs("--config-file", cfgFile)
+
+	err := os.MkdirAll("/tmp/test/pouch/containerd/state", 0664)
+	c.Assert(err, check.IsNil)
+
+	containerdPidPath := filepath.Join("/tmp/test/pouch/containerd/state", "containerd.pid")
+
+	// set containerd pid to 1 to make sure the pid must be alive
+	err = ioutil.WriteFile(containerdPidPath, []byte(fmt.Sprintf("%d", 1)), 0660)
+	if err != nil {
+		c.Errorf("failed to write pid to file: %v", containerdPidPath)
+	}
+
+	// make sure pouchd can successfully start
+	c.Assert(cfg.StartDaemon(), check.IsNil)
+	defer cfg.KillDaemon()
+}
+
+// TestUpdateDaemonWithHomeDirAndSnapshotter tests update daemon with home-dir and snapshotter
+func (suite *PouchDaemonSuite) TestUpdateDaemonWithHomeDirAndSnapshotter(c *check.C) {
+	path := "/tmp/pouchconfig.json"
+	fd, err := os.Create(path)
+	c.Assert(err, check.IsNil)
+	fd.Close()
+	defer os.Remove(path)
+
+	cfg := daemon.NewConfig()
+	err = cfg.StartDaemon()
+	c.Assert(err, check.IsNil)
+
+	defer cfg.KillDaemon()
+
+	tmpHomeDir := "/tmp/pouch_dir"
+	snapshotter := "test_snapshotter"
+
+	RunWithSpecifiedDaemon(&cfg, "updatedaemon", "--config-file", path, "--offline=true", "--home-dir", tmpHomeDir, "--snapshotter", snapshotter).Assert(c, icmd.Success)
+
+	ret := RunWithSpecifiedDaemon(&cfg, "info")
+	ret.Assert(c, icmd.Success)
+
+	f, err := os.Open(path)
+	c.Assert(err, check.IsNil)
+	defer f.Close()
+
+	readConfig := config.Config{}
+
+	err = json.NewDecoder(f).Decode(&readConfig)
+	c.Assert(err, check.IsNil)
+
+	c.Assert(readConfig.HomeDir, check.Equals, tmpHomeDir)
+	c.Assert(readConfig.Snapshotter, check.Equals, snapshotter)
+}
+
+// TestUpdateDaemonWithDisableBridge tests update daemon with disable bridge network
+func (suite *PouchDaemonSuite) TestUpdateDaemonWithDisableBridge(c *check.C) {
+	d := daemonv2.New()
+
+	// modify test config
+	d.Config.NetworkConfig.BridgeConfig.DisableBridge = true
+
+	err := d.Start()
+	if err != nil {
+		c.Fatalf("failed to start daemon with json, err(%v)", err)
+	}
+	defer d.Clean()
+
+	res := d.RunCommand("network", "ls")
+	res.Assert(c, icmd.Success)
+
+	if strings.Contains(res.Stdout(), "bridge") {
+		d.RunCommand("network", "rm", "bridge").Assert(c, icmd.Success)
+	}
+
+	d.Restart()
+
+	res = d.RunCommand("network", "ls")
+	res.Assert(c, icmd.Success)
+	if strings.Contains(res.Stdout(), "bridge") {
+		c.Fatalf("failed to disable bridge network")
 	}
 }

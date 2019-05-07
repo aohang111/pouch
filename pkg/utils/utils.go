@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"net"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -305,7 +306,9 @@ func IsFileExist(file string) bool {
 	return false
 }
 
-// StringSliceEqual compare two string slice, ignore the order.
+// StringSliceEqual compares two string slice, ignore the order.
+// If all items in the two string slice are equal, this function will return true
+// even though there may have duplicate elements in the slice, otherwise reture false.
 func StringSliceEqual(s1, s2 []string) bool {
 	if s1 == nil && s2 == nil {
 		return true
@@ -319,14 +322,24 @@ func StringSliceEqual(s1, s2 []string) bool {
 		return false
 	}
 
-	for _, s := range s1 {
-		if !StringInSlice(s2, s) {
-			return false
-		}
+	// mapKeys to remember keys that exist in s1
+	mapKeys := map[string]int{}
+
+	// first list all items in s1
+	for _, v := range s1 {
+		mapKeys[v]++
 	}
 
-	for _, s := range s2 {
-		if !StringInSlice(s1, s) {
+	// second list all items in s2
+	for _, v := range s2 {
+		mapKeys[v]--
+
+		// we may get -1 in two cases:
+		// 1. the item exists in the s2, but not in the s1;
+		// 2. the item exists both in s1 and s2, but has different copies.
+		// Under the condition that the length of slices are equals,
+		// so we can quickly return false.
+		if mapKeys[v] < 0 {
 			return false
 		}
 	}
@@ -421,4 +434,44 @@ func ResolveHomeDir(path string) (string, error) {
 	}
 
 	return realPath, nil
+}
+
+// MatchLabelSelector returns true if labels cover selector.
+func MatchLabelSelector(selector, labels map[string]string) bool {
+	for k, v := range selector {
+		if val, ok := labels[k]; ok {
+			if v != val {
+				return false
+			}
+		} else {
+			return false
+		}
+	}
+	return true
+}
+
+// ExtractIPAndPortFromAddresses extract first valid ip and port from addresses.
+func ExtractIPAndPortFromAddresses(addresses []string) (string, string) {
+	for _, addr := range addresses {
+		addrParts := strings.SplitN(addr, "://", 2)
+		if len(addrParts) != 2 {
+			logrus.Errorf("invalid listening address %s: must be in format [protocol]://[address]", addr)
+			continue
+		}
+
+		switch addrParts[0] {
+		case "tcp":
+			host, port, err := net.SplitHostPort(addrParts[1])
+			if err != nil {
+				logrus.Errorf("failed to split host and port from address: %v", err)
+				continue
+			}
+			return host, port
+		case "unix":
+			continue
+		default:
+			logrus.Errorf("only unix socket or tcp address is support")
+		}
+	}
+	return "", ""
 }

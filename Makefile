@@ -15,6 +15,9 @@
 # TEST_FLAGS used as flags of go test.
 TEST_FLAGS ?= -v --race
 
+# INTEGRATION_FLAGS used as flags of run integration test
+INTEGRATION_FLAGS ?= ""
+
 # DAEMON_BINARY_NAME is the name of binary of daemon.
 DAEMON_BINARY_NAME=pouchd
 
@@ -59,7 +62,7 @@ endif
 API_VERSION="1.24"
 
 # VERSION is used for daemon Release Version in go build.
-VERSION ?= "1.0.1"
+VERSION ?= "1.3.0"
 
 # GIT_COMMIT is used for daemon GitCommit in go build.
 GIT_COMMIT=$(shell git describe --dirty --always --tags 2> /dev/null || true)
@@ -286,13 +289,7 @@ unit-test: modules plugin ## run go unit-test
 integration-test: build-daemon-integration build-integration-test ## run daemon integration-test
 	@echo $@
 	@mkdir -p coverage
-	./hack/testing/run_daemon_integration.sh
-
-.PHONY: cri-v1alpha1-test
-cri-v1alpha1-test: ## run v1 alpha1 cri-v1alpha1-test
-	@echo $@
-	@mkdir -p coverage
-	./hack/testing/run_daemon_cri_integration.sh v1alpha1
+	./hack/testing/run_daemon_integration.sh ${INTEGRATION_FLAGS}
 
 .PHONY: cri-v1alpha2-test
 cri-v1alpha2-test: ## run v1 alpha2 cri-v1alpha2-test
@@ -307,7 +304,7 @@ cri-e2e-test: ## run cri-e2e-test
 	./hack/testing/run_daemon_cri_e2e.sh v1alpha2
 
 .PHONY: test
-test: unit-test integration-test cri-v1alpha1-test cri-v1alpha2-test cri-e2e-test ## run the unit-test, integration-test , cri-v1alpha1-test , cri-v1alpha2-test and cri-e2e-test
+test: unit-test integration-test cri-v1alpha2-test cri-e2e-test ## run the unit-test, integration-test, cri-v1alpha2-test and cri-e2e-test
 
 .PHONY: coverage
 coverage: ## combine coverage after test
@@ -322,6 +319,7 @@ plugin: ## build hook plugin
 	@./hack/module --add-plugin=github.com/alibaba/pouch/hookplugins/criplugin
 	@./hack/module --add-plugin=github.com/alibaba/pouch/hookplugins/volumeplugin
 	@./hack/module --add-plugin=github.com/alibaba/pouch/hookplugins/apiplugin
+	@./hack/module --add-plugin=github.com/alibaba/pouch/hookplugins/imageplugin
 
 .PHONY: help
 help: ## this help

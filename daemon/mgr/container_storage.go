@@ -8,7 +8,10 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
+	"strings"
+	"syscall"
 
 	"github.com/alibaba/pouch/apis/opts"
 	"github.com/alibaba/pouch/apis/types"
@@ -110,12 +113,6 @@ func (mgr *ContainerManager) generateMountPoints(ctx context.Context, c *Contain
 	err = mgr.populateVolumes(ctx, c)
 	if err != nil {
 		return errors.Wrap(err, "failed to populate volumes")
-	}
-
-	// set volumes into /etc/mtab in container
-	err = mgr.setMountTab(ctx, c)
-	if err != nil {
-		return errors.Wrap(err, "failed to set mount tab")
 	}
 
 	return nil
@@ -327,7 +324,8 @@ func (mgr *ContainerManager) getMountPointFromContainers(ctx context.Context, co
 				Destination: oldMountPoint.Destination,
 				Driver:      oldMountPoint.Driver,
 				Named:       oldMountPoint.Named,
-				RW:          oldMountPoint.RW,
+				Mode:        oldMountPoint.Mode,
+				Replace:     oldMountPoint.Replace,
 				Propagation: oldMountPoint.Propagation,
 			}
 
@@ -348,8 +346,19 @@ func (mgr *ContainerManager) getMountPointFromContainers(ctx context.Context, co
 				return err
 			}
 
-			// the volumes from VolumeFrom is not allowed to CopyData
-			mp.CopyData = false
+			// if mode has no set rw mode, so need to inherit old mountpoint rw mode.
+			if !(strings.Contains(mode, "ro") || strings.Contains(mode, "rw")) {
+				mp.RW = oldMountPoint.RW
+			}
+
+			// if mode has no set copy mode, so need to inherit old mountpoint copy mode.
+			if !strings.Contains(mode, "nocopy") {
+				if !strings.Contains(oldMountPoint.Mode, "nocopy") {
+					mp.CopyData = true
+				} else {
+					mp.CopyData = false
+				}
+			}
 
 			container.Mounts = append(container.Mounts, mp)
 		}
@@ -359,6 +368,12 @@ func (mgr *ContainerManager) getMountPointFromContainers(ctx context.Context, co
 }
 
 func (mgr *ContainerManager) populateVolumes(ctx context.Context, c *Container) error {
+	// sort mounts by destination directory string shortest length.
+	// the reason is: there are two mounts: /home/admin and /home/admin/log,
+	// when do copy data with dr mode, if the data of /home/admin/log is copied first,
+	// it will cause /home/admin don't copy data since the destination directory is not empty.
+	c.Mounts = sortMountPoint(c.Mounts)
+
 	for _, mp := range c.Mounts {
 		if mp.Driver == "tmpfs" {
 			continue
@@ -457,88 +472,8 @@ func (mgr *ContainerManager) setMountTab(ctx context.Context, c *Container) erro
 	return nil
 }
 
-func (mgr *ContainerManager) setRootfsQuota(ctx context.Context, c *Container) error {
-	logrus.Debugf("start to set rootfs quota, dir(%s)", c.MountFS)
-
-	if c.MountFS == "" {
-		return nil
-	}
-
-	rootfsQuota := quota.GetDefaultQuota(c.Config.DiskQuota)
-	if rootfsQuota == "" {
-		return nil
-	}
-
-	qid := "0"
-	if c.Config.QuotaID != "" {
-		qid = c.Config.QuotaID
-	}
-
-	id, err := strconv.Atoi(qid)
-	if err != nil {
-		return errors.Wrapf(err, "failed to change quota id(%s) from string to int", qid)
-	}
-
-	// set rootfs quota
-	_, err = quota.SetRootfsDiskQuota(c.MountFS, rootfsQuota, uint32(id))
-	if err != nil {
-		return errors.Wrapf(err, "failed to set rootfs quota, mountfs(%s), quota(%s), quota id(%d)",
-			c.MountFS, rootfsQuota, id)
-	}
-
-	return nil
-}
-
-func (mgr *ContainerManager) setMountPointDiskQuota(ctx context.Context, c *Container) error {
-	if c.Config.DiskQuota == nil {
-		if c.Config.QuotaID != "" && c.Config.QuotaID != "0" {
-			return fmt.Errorf("invalid argument, set quota-id without disk-quota")
-		}
-		return nil
-	}
-
-	var (
-		qid        uint32
-		setQuotaID bool
-	)
-
-	if c.Config.QuotaID != "" {
-		id, err := strconv.Atoi(c.Config.QuotaID)
-		if err != nil {
-			return errors.Wrapf(err, "invalid argument, QuotaID(%s)", c.Config.QuotaID)
-		}
-
-		// if QuotaID is < 0, it means pouchd alloc a unique quota id.
-		if id < 0 {
-			qid, err = quota.GetNextQuotaID()
-			if err != nil {
-				return errors.Wrap(err, "failed to get next quota id")
-			}
-
-			// update QuotaID
-			c.Config.QuotaID = strconv.Itoa(int(qid))
-		} else {
-			qid = uint32(id)
-		}
-	}
-
-	if qid > 0 {
-		setQuotaID = true
-	}
-
-	// get rootfs quota
-	quotas := c.Config.DiskQuota
-	defaultQuota := quota.GetDefaultQuota(quotas)
-	if setQuotaID && defaultQuota == "" {
-		return fmt.Errorf("set quota id but have no set default quota size")
-	}
-
-	// parse diskquota regexe
-	var res []*quota.RegExp
-	for path, size := range quotas {
-		re := regexp.MustCompile(path)
-		res = append(res, &quota.RegExp{Pattern: re, Path: path, Size: size})
-	}
+func (mgr *ContainerManager) getDiskQuotaMountPoints(ctx context.Context, c *Container, mounted bool) ([]*types.MountPoint, error) {
+	var mounts []*types.MountPoint
 
 	for _, mp := range c.Mounts {
 		// skip volume mount or replace mode mount
@@ -547,6 +482,7 @@ func (mgr *ContainerManager) setMountPointDiskQuota(ctx context.Context, c *Cont
 			continue
 		}
 
+		// skip volume that has set size
 		if mp.Name != "" {
 			v, err := mgr.VolumeMgr.Get(ctx, mp.Name)
 			if err != nil {
@@ -566,33 +502,146 @@ func (mgr *ContainerManager) setMountPointDiskQuota(ctx context.Context, c *Cont
 			continue
 		}
 
-		matched := false
-		for _, re := range res {
-			findStr := re.Pattern.FindString(mp.Destination)
-			if findStr == mp.Destination {
-				quotas[mp.Destination] = re.Size
-				matched = true
-				if re.Path != ".*" {
-					break
-				}
-			}
+		mounts = append(mounts, mp)
+	}
+
+	// add rootfs mountpoint
+	rootfs, err := mgr.getRootfs(ctx, c, mounted)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to get rootfs")
+	}
+	mounts = append(mounts, &types.MountPoint{
+		Source:      rootfs,
+		Destination: "/",
+	})
+
+	return mounts, nil
+}
+
+func checkDupQuotaMap(qms []*quota.QMap, qm *quota.QMap) *quota.QMap {
+	for _, prev := range qms {
+		if qm.Expression != "" && qm.Expression == prev.Expression {
+			return prev
+		}
+	}
+	return nil
+}
+
+func (mgr *ContainerManager) setDiskQuota(ctx context.Context, c *Container, mounted bool) error {
+	var (
+		err           error
+		globalQuotaID uint32
+	)
+
+	// get default quota
+	quotas := c.Config.DiskQuota
+
+	if quota.IsSetQuotaID(c.Config.QuotaID) {
+		id, err := strconv.Atoi(c.Config.QuotaID)
+		if err != nil {
+			return errors.Wrapf(err, "invalid argument, QuotaID(%s)", c.Config.QuotaID)
 		}
 
-		size := ""
-		if matched && !setQuotaID {
-			size = quotas[mp.Destination]
+		// if QuotaID is < 0, it means pouchd alloc a unique quota id.
+		if id < 0 {
+			globalQuotaID, err = quota.GetNextQuotaID()
+			if err != nil {
+				return errors.Wrap(err, "failed to get next quota id")
+			}
+
+			// update QuotaID
+			c.Config.QuotaID = strconv.Itoa(int(globalQuotaID))
 		} else {
-			size = defaultQuota
-		}
-		err := quota.SetDiskQuota(mp.Source, size, qid)
-		if err != nil {
-			// just ignore set disk quota fail
-			logrus.Warnf("failed to set disk quota, directory(%s), size(%s), quotaID(%d), err(%v)",
-				mp.Source, size, qid, err)
+			globalQuotaID = uint32(id)
 		}
 	}
 
-	c.Config.DiskQuota = quotas
+	// get mount points that can set disk quota.
+	mounts, err := mgr.getDiskQuotaMountPoints(ctx, c, mounted)
+	if err != nil {
+		return errors.Wrap(err, "failed to get mount point that can set disk quota")
+	}
+
+	var qms []*quota.QMap
+	for _, mp := range mounts {
+		// get quota size
+		var (
+			found bool
+			qm    *quota.QMap
+		)
+		for exp, size := range quotas {
+			if strings.Contains(exp, "&") {
+				for _, p := range strings.Split(exp, "&") {
+					if p == mp.Destination {
+						found = true
+						qm = &quota.QMap{
+							Source:      mp.Source,
+							Destination: mp.Destination,
+							Expression:  exp,
+							Size:        size,
+						}
+						break
+					}
+				}
+			} else {
+				re := regexp.MustCompile(exp)
+
+				findStr := re.FindString(mp.Destination)
+				if findStr == mp.Destination {
+					qm = &quota.QMap{
+						Source:      mp.Source,
+						Destination: mp.Destination,
+						Size:        size,
+					}
+					if exp != ".*" {
+						break
+					}
+				}
+			}
+
+			if found {
+				break
+			}
+		}
+
+		if qm != nil {
+			// check duplicate quota map
+			prev := checkDupQuotaMap(qms, qm)
+			if prev == nil {
+				// get new quota id
+				id := globalQuotaID
+				if id == 0 {
+					id, err = quota.GetNextQuotaID()
+					if err != nil {
+						return errors.Wrap(err, "failed to get next quota id")
+					}
+				}
+				qm.QuotaID = id
+			} else {
+				qm.QuotaID = prev.QuotaID
+			}
+
+			qms = append(qms, qm)
+		}
+	}
+
+	// make quota effective
+	for _, qm := range qms {
+		if qm.Destination == "/" {
+			// set rootfs quota
+			_, err = quota.SetRootfsDiskQuota(qm.Source, qm.Size, qm.QuotaID)
+			if err != nil {
+				logrus.Warnf("failed to set rootfs quota, mountfs(%s), size(%s), quota id(%d), err(%v)",
+					qm.Source, qm.Size, qm.QuotaID, err)
+			}
+		} else {
+			err := quota.SetDiskQuota(qm.Source, qm.Size, qm.QuotaID)
+			if err != nil {
+				logrus.Warnf("failed to set disk quota, directory(%s), size(%s), quota id(%d), err(%v)",
+					qm.Source, qm.Size, qm.QuotaID, err)
+			}
+		}
+	}
 
 	return nil
 }
@@ -621,9 +670,6 @@ func (mgr *ContainerManager) detachVolumes(ctx context.Context, c *Container, re
 
 // setMountFS is used to set mountfs directory.
 func (mgr *ContainerManager) setMountFS(ctx context.Context, c *Container) {
-	c.Lock()
-	defer c.Unlock()
-
 	c.MountFS = path.Join(mgr.Store.Path(c.ID), "rootfs")
 }
 
@@ -685,13 +731,14 @@ func (mgr *ContainerManager) initContainerStorage(ctx context.Context, c *Contai
 	}
 
 	// set mount point disk quota
-	if err = mgr.setMountPointDiskQuota(ctx, c); err != nil {
-		return errors.Wrap(err, "failed to set mount point disk quota")
+	if err = mgr.setDiskQuota(ctx, c, true); err != nil {
+		// just ignore failed to set disk quota
+		logrus.Warnf("failed to set disk quota, err(%v)", err)
 	}
 
-	// set rootfs disk quota
-	if err = mgr.setRootfsQuota(ctx, c); err != nil {
-		logrus.Warnf("failed to set rootfs disk quota, err(%v)", err)
+	// set volumes into /etc/mtab in container
+	if err = mgr.setMountTab(ctx, c); err != nil {
+		return errors.Wrap(err, "failed to set mount tab")
 	}
 
 	return nil
@@ -717,6 +764,46 @@ func (mgr *ContainerManager) SetupWorkingDirectory(ctx context.Context, c *Conta
 	}
 
 	return nil
+}
+
+func (mgr *ContainerManager) getRootfs(ctx context.Context, c *Container, mounted bool) (string, error) {
+	var (
+		rootfs string
+		err    error
+	)
+	if c.IsRunningOrPaused() && c.Snapshotter != nil {
+		basefs, ok := c.Snapshotter.Data["MergedDir"]
+		if !ok || basefs == "" {
+			return "", fmt.Errorf("Container is running, but MergedDir is missing")
+		}
+		rootfs = basefs
+	} else if !mounted {
+		if err = mgr.Mount(ctx, c); err != nil {
+			return "", errors.Wrapf(err, "failed to mount rootfs: (%s)", c.MountFS)
+		}
+		rootfs = c.MountFS
+
+		defer func() {
+			if err = mgr.Unmount(ctx, c); err != nil {
+				logrus.Errorf("failed to umount rootfs: (%s), err: (%v)", c.MountFS, err)
+			}
+		}()
+	} else {
+		rootfs = c.MountFS
+	}
+
+	return rootfs, nil
+}
+
+func sortMountPoint(mounts []*types.MountPoint) []*types.MountPoint {
+	sort.Slice(mounts, func(i, j int) bool {
+		if len(mounts[i].Destination) < len(mounts[j].Destination) {
+			return true
+		}
+		return false
+	})
+
+	return mounts
 }
 
 func copyImageContent(source, destination string) error {
@@ -776,5 +863,16 @@ func copyOwnership(source, destination string) error {
 	if err != nil {
 		return err
 	}
+
+	sys, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("failed to get file %s system info", source)
+	}
+
+	err = os.Chown(destination, int(sys.Uid), int(sys.Gid))
+	if err != nil {
+		return err
+	}
+
 	return os.Chmod(destination, os.FileMode(fi.Mode()))
 }

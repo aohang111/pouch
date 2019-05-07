@@ -19,7 +19,9 @@ type UpdateConfig struct {
 	// update disk quota for container
 	DiskQuota map[string]string `json:"DiskQuota,omitempty"`
 
-	// A list of environment variables to set inside the container in the form `["VAR=value", ...]`. A variable without `=` is removed from the environment, rather than to have an empty value.
+	// A list of environment variables to set inside the container in the form `["VAR=value", ...]`.
+	// A variable like "A=" means updating env A in container to be empty value.
+	// A variable without `=` is removed from the environment, rather than to have an empty value.
 	//
 	Env []string `json:"Env"`
 
@@ -28,6 +30,9 @@ type UpdateConfig struct {
 
 	// restart policy
 	RestartPolicy *RestartPolicy `json:"RestartPolicy,omitempty"`
+
+	// update specAnnotation for container
+	SpecAnnotation map[string]string `json:"SpecAnnotation,omitempty"`
 }
 
 // UnmarshalJSON unmarshals this object from a JSON structure
@@ -48,6 +53,8 @@ func (m *UpdateConfig) UnmarshalJSON(raw []byte) error {
 		Label []string `json:"Label"`
 
 		RestartPolicy *RestartPolicy `json:"RestartPolicy,omitempty"`
+
+		SpecAnnotation map[string]string `json:"SpecAnnotation,omitempty"`
 	}
 	if err := swag.ReadJSON(raw, &dataAO1); err != nil {
 		return err
@@ -60,6 +67,8 @@ func (m *UpdateConfig) UnmarshalJSON(raw []byte) error {
 	m.Label = dataAO1.Label
 
 	m.RestartPolicy = dataAO1.RestartPolicy
+
+	m.SpecAnnotation = dataAO1.SpecAnnotation
 
 	return nil
 }
@@ -82,6 +91,8 @@ func (m UpdateConfig) MarshalJSON() ([]byte, error) {
 		Label []string `json:"Label"`
 
 		RestartPolicy *RestartPolicy `json:"RestartPolicy,omitempty"`
+
+		SpecAnnotation map[string]string `json:"SpecAnnotation,omitempty"`
 	}
 
 	dataAO1.DiskQuota = m.DiskQuota
@@ -91,6 +102,8 @@ func (m UpdateConfig) MarshalJSON() ([]byte, error) {
 	dataAO1.Label = m.Label
 
 	dataAO1.RestartPolicy = m.RestartPolicy
+
+	dataAO1.SpecAnnotation = m.SpecAnnotation
 
 	jsonDataAO1, errAO1 := swag.WriteJSON(dataAO1)
 	if errAO1 != nil {

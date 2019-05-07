@@ -33,6 +33,7 @@ type DaemonUpdateCommand struct {
 	label            []string
 	managerWhiteList string
 	execRoot         string
+	disableBridge    bool
 	bridgeName       string
 	bridgeIP         string
 	fixedCIDRv4      string
@@ -40,6 +41,9 @@ type DaemonUpdateCommand struct {
 	iptables         bool
 	ipforward        bool
 	userlandProxy    bool
+
+	homeDir     string
+	snapshotter string
 }
 
 // Init initialize updatedaemon command.
@@ -70,6 +74,7 @@ func (udc *DaemonUpdateCommand) addFlags() {
 	flagSet.StringVar(&udc.managerWhiteList, "manager-white-list", "", "update daemon manager white list")
 	flagSet.StringSliceVar(&udc.label, "label", nil, "update daemon labels")
 	flagSet.StringVar(&udc.execRoot, "exec-root-dir", "", "update exec root directory for network")
+	flagSet.BoolVar(&udc.disableBridge, "disable-bridge", false, "disable bridge network")
 	flagSet.StringVar(&udc.bridgeName, "bridge-name", "", "update daemon bridge device")
 	flagSet.StringVar(&udc.bridgeIP, "bip", "", "update daemon bridge IP")
 	flagSet.StringVar(&udc.fixedCIDRv4, "fixed-cidr", "", "update daemon bridge fixed CIDR")
@@ -77,6 +82,8 @@ func (udc *DaemonUpdateCommand) addFlags() {
 	flagSet.BoolVar(&udc.iptables, "iptables", true, "update daemon with iptables")
 	flagSet.BoolVar(&udc.ipforward, "ipforward", true, "udpate daemon with ipforward")
 	flagSet.BoolVar(&udc.userlandProxy, "userland-proxy", false, "update daemon with userland proxy")
+	flagSet.StringVar(&udc.homeDir, "home-dir", "", "update daemon home dir")
+	flagSet.StringVar(&udc.snapshotter, "snapshotter", "", "update daemon snapshotter")
 }
 
 // daemonUpdateRun is the entry of updatedaemon command.
@@ -138,6 +145,10 @@ func (udc *DaemonUpdateCommand) updateDaemonConfigFile() error {
 		daemonConfig.NetworkConfig.ExecRoot = udc.execRoot
 	}
 
+	if flagSet.Changed("disable-bridge") {
+		daemonConfig.NetworkConfig.BridgeConfig.DisableBridge = udc.disableBridge
+	}
+
 	if flagSet.Changed("bridge-name") {
 		daemonConfig.NetworkConfig.BridgeConfig.Name = udc.bridgeName
 	}
@@ -164,6 +175,14 @@ func (udc *DaemonUpdateCommand) updateDaemonConfigFile() error {
 
 	if flagSet.Changed("userland-proxy") {
 		daemonConfig.NetworkConfig.BridgeConfig.UserlandProxy = udc.userlandProxy
+	}
+
+	if flagSet.Changed("home-dir") {
+		daemonConfig.HomeDir = udc.homeDir
+	}
+
+	if flagSet.Changed("snapshotter") {
+		daemonConfig.Snapshotter = udc.snapshotter
 	}
 
 	// write config to file

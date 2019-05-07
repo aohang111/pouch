@@ -18,7 +18,7 @@ import (
 	"github.com/alibaba/pouch/pkg/jsonstream"
 	"github.com/alibaba/pouch/pkg/reference"
 
-	"github.com/containerd/containerd/progress"
+	"github.com/containerd/containerd/pkg/progress"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/ssh/terminal"
 )
@@ -157,7 +157,7 @@ func displayImageReferenceProgress(output io.Writer, isTerminal bool, msgs []jso
 			current += msg.Detail.Current
 		}
 
-		status := jsonstream.PullReferenceStatus(!isTerminal, msg)
+		status := jsonstream.ProcessStatus(!isTerminal, msg)
 		if _, err := fmt.Fprint(tw, status); err != nil {
 			return err
 		}
