@@ -10,6 +10,8 @@ type ContainerHeader map[string]string
 type ContainerContext map[string]string
 
 func NewContainerHeader() ContainerHeader {
+	//need to specify how the Mounts shows
+	//if need to show another attr of container.add vaule in the map
 	containerHeader := ContainerHeader{
 		"Name":    "Name",
 		"ID":      "ID",
@@ -19,7 +21,7 @@ func NewContainerHeader() ContainerHeader {
 		"Runtime": "Runtime",
 		"Command": "Command",
 		"ImageID": "ImageID",
-		//"Labels":  "Labels",
+		"Labels":  "Labels",
 		//"Mounts":  "Mounts",
 		"State": "State",
 	}
@@ -28,6 +30,7 @@ func NewContainerHeader() ContainerHeader {
 func NewContainerContext(c *types.Container) ContainerContext {
 	id := c.ID[:6]
 	created, _ := utils.FormatTimeInterval(c.Created)
+	labels := LabelsToString(c.Labels)
 	containerContext := ContainerContext{
 		"Name":    c.Names[0],
 		"ID":      id,
@@ -37,7 +40,7 @@ func NewContainerContext(c *types.Container) ContainerContext {
 		"Runtime": c.HostConfig.Runtime,
 		"Command": c.Command,
 		"ImageID": c.ImageID,
-		//"Labels":  "Labels",
+		"Labels":  labels,
 		//"Mounts":  "Mounts",
 		"State": c.State,
 	}
