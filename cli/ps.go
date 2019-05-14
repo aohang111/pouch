@@ -4,10 +4,11 @@ import (
 	"context"
 	"fmt"
 	"sort"
+	"text/template"
 	"time"
 
 	"github.com/alibaba/pouch/apis/types"
-	"github.com/alibaba/pouch/pkg/utils"
+	"github.com/alibaba/pouch/cli/formatter"
 	"github.com/alibaba/pouch/pkg/utils/filters"
 
 	"github.com/spf13/cobra"
@@ -28,6 +29,7 @@ type PsCommand struct {
 	flagQuiet   bool
 	flagNoTrunc bool
 	flagFilter  []string
+	flagFormat  string
 }
 
 // Init initializes PsCommand command.
@@ -52,6 +54,7 @@ func (p *PsCommand) addFlags() {
 	flagSet.BoolVarP(&p.flagAll, "all", "a", false, "Show all containers (default shows just running)")
 	flagSet.BoolVarP(&p.flagQuiet, "quiet", "q", false, "Only show numeric IDs")
 	flagSet.BoolVar(&p.flagNoTrunc, "no-trunc", false, "Do not truncate output")
+	flagSet.StringVarP(&p.flagFormat, "format", "", "", "intelligent-print containers based on Go template")
 	flagSet.StringSliceVarP(&p.flagFilter, "filter", "f", nil, "Filter output based on given conditions, support filter key [ id label name status ]")
 }
 
@@ -88,24 +91,21 @@ func (p *PsCommand) runPs(args []string) error {
 		}
 		return nil
 	}
-
-	display := p.cli.NewTableDisplay()
-	display.AddRow([]string{"Name", "ID", "Status", "Created", "Image", "Runtime"})
+	//add to format the output with go template
+	format := p.flagFormat
+	containerHeader := formatter.NewContainerHeader()
+	tmplH := template.New("ps_head")
+	if len(format) == 0 {
+		format = "{{.Name}}\t{{.ID}}\t{{.Status}}\t{{.Created}}\t{{.Image}}\t{{.Runtime}}\n"
+	}
+	format = formatter.PreFormat(format)
+	p.cli.FormatDisplay(format, tmplH, containerHeader)
 
 	for _, c := range containers {
-		created, err := utils.FormatTimeInterval(c.Created)
-		if err != nil {
-			return err
-		}
-
-		id := c.ID[:6]
-		if p.flagNoTrunc {
-			id = c.ID
-		}
-
-		display.AddRow([]string{c.Names[0], id, c.Status, created + " ago", c.Image, c.HostConfig.Runtime})
+		containerContext := formatter.NewContainerContext(c)
+		tmplD := template.New("ps_detail")
+		p.cli.FormatDisplay(format, tmplD, containerContext)
 	}
-	display.Flush()
 	return nil
 }
 
